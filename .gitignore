@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyc
+*.pyo
+.Python
+env/
+venv/
+.venv/
+ENV/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# PyInstaller
+build/
+dist/
+*.manifest
+*.spec.bak
+*.exe
+# но оставляем исходный ExcelWorker.spec — раскомментируйте если хотите игнорить
+# ExcelWorker.spec
+
+# Excel / Temp
+*.xlsx
+!test*.xlsx
+~$*.xlsx
+*.pdf
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temp
+tmp/
+temp/
