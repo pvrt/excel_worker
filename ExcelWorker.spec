@@ -18,6 +18,7 @@ a = Analysis(
         'reportlab.platypus',
         'openpyxl',
         'PIL',
+        'pikepdf',
     ],
     hookspath=[],
     hooksconfig={},

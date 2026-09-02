@@ -94,6 +94,50 @@ def sanitize_filename(name: str) -> str:
     return sanitized or "document"
 
 
+def parse_page_spec(spec: str, total_pages: int) -> list[int]:
+    """Парсит '1,3,5-7' / 'все' в список 0-based индексов. Пусто/все -> все страницы."""
+    spec = spec.strip().lower()
+    if not spec or spec in ("все", "all", "*", "—", "-"):
+        return list(range(total_pages))
+    result: list[int] = []
+    for part in re.split(r"[,\s;]+", spec):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                a, b = part.split("-", 1)
+                start = int(a.strip())
+                end = int(b.strip())
+                if start > end:
+                    start, end = end, start
+                for n in range(start, end + 1):
+                    if 1 <= n <= total_pages and (n - 1) not in result:
+                        result.append(n - 1)
+                    elif not 1 <= n <= total_pages:
+                        raise ValueError(f"Страница {n} вне 1-{total_pages}")
+            except ValueError as ve:
+                # уже с сообщением
+                if "вне" in str(ve):
+                    raise
+                raise ValueError(f"Неверный диапазон '{part}'") from ve
+        else:
+            try:
+                n = int(part)
+                if 1 <= n <= total_pages:
+                    if (n - 1) not in result:
+                        result.append(n - 1)
+                else:
+                    raise ValueError(f"Страница {n} вне 1-{total_pages}")
+            except ValueError as ve:
+                if "вне" in str(ve):
+                    raise
+                raise ValueError(f"Неверный номер '{part}'") from ve
+    if not result:
+        raise ValueError("Не указаны страницы")
+    return sorted(result)
+
+
 def find_soffice_executable() -> str | None:
     """Ищет исполняемый файл LibreOffice (soffice)."""
     candidates = [
@@ -1250,6 +1294,92 @@ def process_xlsx_to_pdf(
         finish_callback(False, str(e))
 
 
+def process_pdf_merge(
+    pdf1_path: str,
+    pdf2_path: str,
+    output_path: str,
+    pages_spec: str,
+    log_callback,
+    progress_callback,
+    finish_callback,
+):
+    """Фоновое объединение 2 PDF: весь pdf1 + выбранные страницы pdf2."""
+    try:
+        p1 = Path(pdf1_path)
+        p2 = Path(pdf2_path)
+        out = Path(output_path)
+        if not p1.is_file():
+            finish_callback(False, f"Не найден файл PDF1:\n{pdf1_path}")
+            return
+        if not p2.is_file():
+            finish_callback(False, f"Не найден файл PDF2:\n{pdf2_path}")
+            return
+        if p1.resolve() == out.resolve() or p2.resolve() == out.resolve():
+            finish_callback(False, "Выходной файл не должен совпадать с входными.")
+            return
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            import pikepdf
+        except ImportError as e:
+            finish_callback(False, "Не установлен pikepdf. Выполните: pip install pikepdf")
+            return
+
+        log_callback(f"Чтение PDF1: {p1.name}")
+        progress_callback(5)
+        pdf1 = pikepdf.open(str(p1))
+        n1 = len(pdf1.pages)
+        log_callback(f"PDF1 страниц: {n1}")
+
+        log_callback(f"Чтение PDF2: {p2.name}")
+        progress_callback(15)
+        pdf2 = pikepdf.open(str(p2))
+        n2 = len(pdf2.pages)
+        log_callback(f"PDF2 страниц: {n2}")
+
+        try:
+            selected = parse_page_spec(pages_spec, n2)
+        except ValueError as ve:
+            pdf1.close()
+            pdf2.close()
+            finish_callback(False, f"Ошибка в выборе страниц PDF2: {ve}\nФормат: 1,3,5-7 или пусто = все. Всего страниц: {n2}")
+            return
+
+        log_callback(f"Выбрано из PDF2: {len(selected)} стр. -> {', '.join(str(i+1) for i in selected) if selected else '—'}")
+        progress_callback(25)
+
+        # Создаём новый PDF
+        log_callback("Объединение...")
+        progress_callback(40)
+        out_pdf = pikepdf.Pdf.new()
+        # Копируем все страницы pdf1
+        for i, page in enumerate(pdf1.pages, 1):
+            out_pdf.pages.append(page)
+            if i % 10 == 0:
+                progress_callback(40 + int(30 * i / max(n1, 1)))
+        progress_callback(70)
+        # Добавляем выбранные из pdf2
+        for idx, page_idx in enumerate(selected, 1):
+            out_pdf.pages.append(pdf2.pages[page_idx])
+            if idx % 10 == 0 or idx == len(selected):
+                progress_callback(70 + int(20 * idx / max(len(selected), 1)))
+
+        log_callback(f"Сохранение: {out}")
+        progress_callback(95)
+        out_pdf.save(str(out))
+        out_pdf.close()
+        pdf1.close()
+        pdf2.close()
+        progress_callback(100)
+        log_callback(f"Готово! Итоговых страниц: {n1 + len(selected)}")
+
+        finish_callback(True, f"Объединено!\nPDF1: {n1} стр.\nPDF2: {len(selected)} из {n2} стр.\nИтого: {n1 + len(selected)} стр.\nСохранено: {out}")
+
+    except Exception as e:
+        log_callback(f"Критическая ошибка: {e}")
+        finish_callback(False, str(e))
+
+
 # ==============================================================================
 #                                GUI ИНТЕРФЕЙС
 # ==============================================================================
@@ -1271,18 +1401,21 @@ class ExcelFinderApp(tk.Tk):
         self.tab_hash = ttk.Frame(notebook)
         self.tab_diff = ttk.Frame(notebook)
         self.tab_pdf = ttk.Frame(notebook)
+        self.tab_merge = ttk.Frame(notebook)
 
         notebook.add(self.tab_bulk, text="  Массовое сопоставление  ")
         notebook.add(self.tab_single, text="  Поиск по списку строк  ")
         notebook.add(self.tab_hash, text="  Хеш-генератор  ")
         notebook.add(self.tab_diff, text="  Сравнение колонок (Diff)  ")
         notebook.add(self.tab_pdf, text="  Конвертер XLSX -> PDF  ")
+        notebook.add(self.tab_merge, text="  Объединение PDF  ")
 
         self._build_tab_bulk()
         self._build_tab_single()
         self._build_tab_hash()
         self._build_tab_diff()
         self._build_tab_pdf()
+        self._build_tab_merge()
 
     def _add_tab_description(self, parent, text: str):
         """Добавляет голубой блок-описание вверху вкладки простым языком."""
@@ -2520,6 +2653,183 @@ class ExcelFinderApp(tk.Tk):
             text="Очистить журнал",
             command=lambda: self.txt_pdf_log.delete(1.0, tk.END),
         ).pack(side="right", padx=3)
+
+    # --------------------------------------------------------------------------
+    #                     ВКЛАДКА 6: ОБЪЕДИНЕНИЕ PDF
+    # --------------------------------------------------------------------------
+    def _build_tab_merge(self):
+        pad_opts = {"padx": 10, "pady": 5}
+
+        self._add_tab_description(
+            self.tab_merge,
+            "Объедините два PDF в один: весь первый файл целиком + выбранные страницы из второго. "
+            "Укажите два PDF, выберите страницы второго (например: 1,3,5-7 или оставьте пусто — все), "
+            "и куда сохранить результат. Удобно, когда нужно приложить выборочные листы из второго документа.",
+        )
+
+        frame_files = ttk.LabelFrame(self.tab_merge, text=" 1. Выберите PDF файлы ", padding=10)
+        frame_files.pack(fill="x", **pad_opts)
+
+        # PDF 1 — целиком
+        f1 = ttk.Frame(frame_files)
+        f1.pack(fill="x", pady=2)
+        ttk.Label(f1, text="PDF 1 (весь):", width=14).pack(side="left")
+        self.ent_merge_pdf1 = ttk.Entry(f1)
+        self.ent_merge_pdf1.pack(side="left", fill="x", expand=True, padx=5)
+        ttk.Button(f1, text="Обзор...", command=self._browse_merge_pdf1).pack(side="left", padx=2)
+        self.lbl_merge_pdf1_pages = ttk.Label(frame_files, text="Страниц: —", font=("Segoe UI", 8), foreground="#666")
+        self.lbl_merge_pdf1_pages.pack(anchor="w", padx=2, pady=(0, 4))
+
+        # PDF 2 — с выбором страниц
+        f2 = ttk.Frame(frame_files)
+        f2.pack(fill="x", pady=(6, 2))
+        ttk.Label(f2, text="PDF 2 (выбор):", width=14).pack(side="left")
+        self.ent_merge_pdf2 = ttk.Entry(f2)
+        self.ent_merge_pdf2.pack(side="left", fill="x", expand=True, padx=5)
+        ttk.Button(f2, text="Обзор...", command=self._browse_merge_pdf2).pack(side="left", padx=2)
+        self.lbl_merge_pdf2_pages = ttk.Label(frame_files, text="Страниц: —", font=("Segoe UI", 8), foreground="#666")
+        self.lbl_merge_pdf2_pages.pack(anchor="w", padx=2, pady=(0, 2))
+
+        # Выбор страниц PDF2
+        f_pages = ttk.Frame(frame_files)
+        f_pages.pack(fill="x", pady=(4, 2))
+        ttk.Label(f_pages, text="Страницы PDF 2:").pack(side="left", padx=(0, 5))
+        self.ent_merge_pages = ttk.Entry(f_pages)
+        self.ent_merge_pages.pack(side="left", fill="x", expand=True, padx=5)
+        self.ent_merge_pages.insert(0, "")
+        ttk.Label(f_pages, text="  (пусто=все)", font=("Segoe UI", 8), foreground="#666").pack(side="left", padx=4)
+        ttk.Label(frame_files, text='Примеры: 1  |  1,3,5  |  2-5  |  1,3,5-7  |  все', font=("Segoe UI", 8), foreground="#666").pack(anchor="w", padx=2)
+
+        # Выходной файл
+        f_out = ttk.Frame(frame_files)
+        f_out.pack(fill="x", pady=(8, 2))
+        ttk.Label(f_out, text="Сохранить как:", width=14).pack(side="left")
+        self.ent_merge_output = ttk.Entry(f_out)
+        self.ent_merge_output.pack(side="left", fill="x", expand=True, padx=5)
+        ttk.Button(f_out, text="Обзор...", command=self._browse_merge_output).pack(side="left", padx=2)
+
+        # Кнопка запуска
+        self.btn_merge_run = ttk.Button(
+            self.tab_merge,
+            text="▶ Объединить PDF",
+            command=self._start_pdf_merge,
+        )
+        self.btn_merge_run.pack(fill="x", padx=10, pady=6)
+
+        self.merge_progress = ttk.Progressbar(self.tab_merge, mode="determinate")
+        self.merge_progress.pack(fill="x", padx=10, pady=2)
+
+        frame_log = ttk.LabelFrame(self.tab_merge, text=" 2. Журнал ", padding=8)
+        frame_log.pack(fill="both", expand=True, **pad_opts)
+
+        self.txt_merge_log = tk.Text(frame_log, height=10, wrap="word", font=("Consolas", 9))
+        self.txt_merge_log.pack(fill="both", expand=True)
+
+        frame_actions = ttk.Frame(self.tab_merge)
+        frame_actions.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Button(frame_actions, text="📂 Открыть папку", command=self._open_merge_output_folder).pack(side="right", padx=3)
+        ttk.Button(frame_actions, text="Очистить журнал", command=lambda: self.txt_merge_log.delete(1.0, tk.END)).pack(side="right", padx=3)
+
+    def _browse_merge_pdf1(self):
+        path = filedialog.askopenfilename(title="Выберите первый PDF", filetypes=[("PDF", "*.pdf"), ("All", "*.*")])
+        if path:
+            self.ent_merge_pdf1.delete(0, tk.END)
+            self.ent_merge_pdf1.insert(0, path)
+            self._update_merge_page_label(self.ent_merge_pdf1, self.lbl_merge_pdf1_pages)
+            # предлагаем выходной файл рядом с первым
+            if not self.ent_merge_output.get():
+                p = Path(path)
+                self.ent_merge_output.insert(0, str(p.parent / f"{p.stem}_merged.pdf"))
+
+    def _browse_merge_pdf2(self):
+        path = filedialog.askopenfilename(title="Выберите второй PDF", filetypes=[("PDF", "*.pdf"), ("All", "*.*")])
+        if path:
+            self.ent_merge_pdf2.delete(0, tk.END)
+            self.ent_merge_pdf2.insert(0, path)
+            self._update_merge_page_label(self.ent_merge_pdf2, self.lbl_merge_pdf2_pages)
+
+    def _browse_merge_output(self):
+        path = filedialog.asksaveasfilename(title="Куда сохранить объединённый PDF", defaultextension=".pdf", filetypes=[("PDF", "*.pdf")])
+        if path:
+            self.ent_merge_output.delete(0, tk.END)
+            self.ent_merge_output.insert(0, path)
+
+    def _update_merge_page_label(self, entry: ttk.Entry, label: ttk.Label):
+        path = entry.get().strip()
+        if not path or not os.path.isfile(path):
+            label.config(text="Страниц: —")
+            return
+        try:
+            import pikepdf
+
+            pdf = pikepdf.open(path)
+            n = len(pdf.pages)
+            pdf.close()
+            label.config(text=f"Страниц: {n}")
+        except Exception as e:
+            label.config(text=f"Ошибка: {e}")
+
+    def _open_merge_output_folder(self):
+        out = self.ent_merge_output.get().strip()
+        folder = str(Path(out).parent) if out else ""
+        if not folder or not os.path.isdir(folder):
+            messagebox.showwarning("Предупреждение", "Папка ещё не создана или путь не указан.")
+            return
+        try:
+            system_name = platform.system()
+            if system_name == "Windows":
+                os.startfile(folder)
+            elif system_name == "Darwin":
+                subprocess.run(["open", folder], check=True)
+            else:
+                subprocess.run(["xdg-open", folder], check=True)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось открыть папку: {e}")
+
+    def _start_pdf_merge(self):
+        pdf1 = self.ent_merge_pdf1.get().strip()
+        pdf2 = self.ent_merge_pdf2.get().strip()
+        out = self.ent_merge_output.get().strip()
+        spec = self.ent_merge_pages.get().strip()
+
+        if not pdf1 or not os.path.isfile(pdf1):
+            messagebox.showwarning("Предупреждение", "Укажите корректный PDF 1!")
+            return
+        if not pdf2 or not os.path.isfile(pdf2):
+            messagebox.showwarning("Предупреждение", "Укажите корректный PDF 2!")
+            return
+        if not out:
+            messagebox.showwarning("Предупреждение", "Укажите путь для сохранения результата!")
+            return
+        # обновляем счётчики
+        self._update_merge_page_label(self.ent_merge_pdf1, self.lbl_merge_pdf1_pages)
+        self._update_merge_page_label(self.ent_merge_pdf2, self.lbl_merge_pdf2_pages)
+
+        self.txt_merge_log.delete(1.0, tk.END)
+        self.merge_progress["value"] = 0
+        self.btn_merge_run.config(state="disabled")
+
+        threading.Thread(
+            target=process_pdf_merge,
+            args=(
+                pdf1,
+                pdf2,
+                out,
+                spec,
+                lambda t: self.after(0, lambda: (self.txt_merge_log.insert(tk.END, t + "\n"), self.txt_merge_log.see(tk.END))),
+                lambda v: self.after(0, lambda: self.merge_progress.config(value=v)),
+                lambda s, m: self.after(0, lambda: self._on_merge_finish(s, m)),
+            ),
+            daemon=True,
+        ).start()
+
+    def _on_merge_finish(self, success, msg):
+        self.btn_merge_run.config(state="normal")
+        self.merge_progress["value"] = 100 if success else 0
+        if success:
+            messagebox.showinfo("Готово", msg)
+        else:
+            messagebox.showerror("Ошибка", msg)
 
     def _on_pdf_engine_changed(self):
         """Показывает/скрывает настройки Google в зависимости от выбранного движка."""
