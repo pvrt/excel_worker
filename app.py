@@ -945,7 +945,7 @@ class ExcelFinderApp(tk.Tk):
         # иконка ℹ
         inner = tk.Frame(wrapper, bg="#EAF0FF")
         inner.pack(fill="x", padx=10, pady=8)
-        tk.Label(inner, text="ℹ", bg="#EAF0FF", fg="#2F5AA0", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(0, 8), anchor="n")
+        tk.Label(inner, text="ℹ", bg="#EAF0FF", fg="#2F5AA0", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(0, 8), anchor="nw")
         tk.Label(
             inner,
             text=text,
@@ -954,7 +954,8 @@ class ExcelFinderApp(tk.Tk):
             font=("Segoe UI", 9),
             wraplength=760,
             justify="left",
-        ).pack(side="left", fill="x", expand=True, anchor="w")
+            anchor="w",
+        ).pack(side="left", fill="both", expand=True, anchor="w")
 
     # --------------------------------------------------------------------------
     #                     ВКЛАДКА 1: МАССОВОЕ СОПОСТАВЛЕНИЕ
