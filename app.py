@@ -20,6 +20,36 @@ def _get_app_dir() -> Path:
     return Path(__file__).parent
 
 
+def _resolve_google_path(path: str) -> str:
+    """Находит credentials/token рядом с exe, в bundle (_MEIPASS) или по переданному пути."""
+    if not path:
+        return path
+    p = Path(path)
+    if p.is_file():
+        return str(p)
+    # пробуем рядом с exe/app
+    app_p = _get_app_dir() / p.name
+    if app_p.is_file():
+        return str(app_p)
+    # пробуем в PyInstaller bundle
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        bundle_p = Path(sys._MEIPASS) / p.name  # type: ignore[attr-defined]
+        if bundle_p.is_file():
+            # копируем из bundle рядом с exe для возможности записи token.json
+            try:
+                if p.name == "token.json" and not app_p.exists():
+                    shutil.copy2(str(bundle_p), str(app_p))
+                    return str(app_p)
+            except Exception:
+                pass
+            return str(bundle_p)
+    # пробуем в cwd
+    cwd_p = Path.cwd() / p.name
+    if cwd_p.is_file():
+        return str(cwd_p)
+    return str(p)
+
+
 # ==============================================================================
 #                             ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==============================================================================
@@ -207,7 +237,11 @@ GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
 def _get_google_drive_service(credentials_path: str = "credentials.json", token_path: str = "token.json"):
-    """Создаёт сервис Google Drive с OAuth (credentials.json -> token.json)."""
+    """Создаёт сервис Google Drive с OAuth (credentials.json -> token.json). Поддерживает Service Account."""
+    # Резолвим пути: ищем рядом с exe, в bundle, в cwd
+    credentials_path = _resolve_google_path(credentials_path)
+    # token ищем, но для записи всегда используем папку рядом с exe
+    token_path_resolved = _resolve_google_path(token_path)
     # Для корпоративных прокси с самоподписанным сертификатом — отключаем проверку SSL
     try:
         import ssl
@@ -248,9 +282,9 @@ def _get_google_drive_service(credentials_path: str = "credentials.json", token_
         pass
 
     creds = None
-    if os.path.exists(token_path):
+    if os.path.exists(token_path_resolved):
         try:
-            creds = Credentials.from_authorized_user_file(token_path, GOOGLE_DRIVE_SCOPES)
+            creds = Credentials.from_authorized_user_file(token_path_resolved, GOOGLE_DRIVE_SCOPES)
         except Exception:
             creds = None
     if not creds or not creds.valid:
@@ -268,10 +302,18 @@ def _get_google_drive_service(credentials_path: str = "credentials.json", token_
                 )
             flow = InstalledAppFlow.from_client_secrets_file(credentials_path, GOOGLE_DRIVE_SCOPES)
             creds = flow.run_local_server(port=0)
-            # Сохраняем токен
+            # Сохраняем токен рядом с exe (не в bundle, который read-only)
             try:
-                with open(token_path, "w", encoding="utf-8") as f:
+                save_path = str(_get_app_dir() / "token.json")
+                with open(save_path, "w", encoding="utf-8") as f:
                     f.write(creds.to_json())
+                # также пробуем сохранить по исходному пути для совместимости
+                if save_path != token_path_resolved:
+                    try:
+                        with open(token_path_resolved, "w", encoding="utf-8") as f:
+                            f.write(creds.to_json())
+                    except Exception:
+                        pass
             except Exception:
                 pass
     try:

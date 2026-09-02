@@ -5,7 +5,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('credentials.json', '.'), ('token.json', '.')] if __import__('os').path.exists('credentials.json') else [],
     hiddenimports=[
         'googleapiclient.discovery',
         'googleapiclient.http',
