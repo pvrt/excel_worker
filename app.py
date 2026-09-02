@@ -2756,13 +2756,18 @@ class ExcelFinderApp(tk.Tk):
         self.ent_google_token.insert(0, default_tok)
         ttk.Button(f_tok, text="Обзор...", command=self._browse_google_token).pack(side="left", padx=2)
 
+        # Статус встроенных credentials
+        self.lbl_google_embedded = ttk.Label(self.frame_google, text="", font=("Segoe UI", 8, "bold"), wraplength=760, justify="left")
+        self.lbl_google_embedded.pack(anchor="w", pady=(6, 0))
+        # Обновим статус после создания виджетов
+        self.after(100, self._update_google_embedded_status)
+
         ttk.Label(
             self.frame_google,
             text=(
-                "OAuth (для себя): Cloud Console → APIs & Services → Library → Drive API → Enable → "
-                "Credentials → OAuth consent (External) → Create OAuth client ID (Desktop) → скачайте credentials.json.\n"
-                "Service Account (для раздачи другим, рекомендуется): IAM & Admin → Service Accounts → Create service account → "
-                "Create Key (JSON) → скачайте как credentials.json → расшарьте папку Google Drive на email сервис-аккаунта (Editor)."
+                "Для приватного репо credentials уже встроены — просто выберите Google и конвертируйте, путь указывать не нужно.\n"
+                "Если нужно свои ключи: OAuth — Cloud Console → Drive API → Credentials → OAuth client ID (Desktop);\n"
+                "Service Account — IAM → Service Accounts → Create → Key JSON → расшарьте папку на email сервис-аккаунта."
             ),
             font=("Segoe UI", 8),
             foreground="#666",
@@ -3038,6 +3043,7 @@ class ExcelFinderApp(tk.Tk):
                 self.frame_google.pack(fill="x", padx=10, pady=5, before=self.btn_pdf_run)
             except Exception:
                 self.frame_google.pack(fill="x", padx=10, pady=5)
+            self._update_google_embedded_status()
         else:
             self.frame_google.pack_forget()
 
@@ -3050,12 +3056,14 @@ class ExcelFinderApp(tk.Tk):
             tok = str(Path(path).parent / "token.json")
             self.ent_google_token.delete(0, tk.END)
             self.ent_google_token.insert(0, tok)
+        self._update_google_embedded_status()
 
     def _browse_google_token(self):
         path = filedialog.askopenfilename(title="Выберите token.json", filetypes=[("JSON", "*.json"), ("All", "*.*")])
         if path:
             self.ent_google_token.delete(0, tk.END)
             self.ent_google_token.insert(0, path)
+        self._update_google_embedded_status()
 
     def _test_google_connection(self):
         cred = self.ent_google_creds.get().strip() if hasattr(self, "ent_google_creds") else "credentials.json"
@@ -3075,6 +3083,44 @@ class ExcelFinderApp(tk.Tk):
             messagebox.showerror("Проверка Google", f"Ошибка подключения:\n{e}")
             self.txt_pdf_log.insert(tk.END, f"Google ошибка: {e}\n")
         self.txt_pdf_log.see(tk.END)
+        self._update_google_embedded_status()
+
+    def _update_google_embedded_status(self):
+        if not hasattr(self, "lbl_google_embedded"):
+            return
+        try:
+            cred = self.ent_google_creds.get().strip() if hasattr(self, "ent_google_creds") else str(_get_app_dir() / "credentials.json")
+            resolved = _resolve_google_path(cred) if cred else ""
+            if resolved and os.path.isfile(resolved):
+                try:
+                    import json
+
+                    with open(resolved, "r", encoding="utf-8") as f:
+                        is_sa = json.load(f).get("type") == "service_account"
+                    typ = "Service Account" if is_sa else "OAuth"
+                    self.lbl_google_embedded.config(text=f"✓ Найдено {typ} credentials.json — указывать путь не нужно, просто выберите Google.", foreground="#1a7f37")
+                except Exception:
+                    self.lbl_google_embedded.config(text="✓ Найдены credentials.json — указывать путь не нужно.", foreground="#1a7f37")
+            else:
+                app_cred = _get_app_dir() / "credentials.json"
+                if app_cred.is_file():
+                    self.lbl_google_embedded.config(text="✓ Найдены встроенные credentials.json — указывать путь не нужно.", foreground="#1a7f37")
+                else:
+                    # также проверяем bundle
+                    bundle_ok = False
+                    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+                        try:
+                            bundle_p = Path(sys._MEIPASS) / "credentials.json"  # type: ignore[attr-defined]
+                            if bundle_p.is_file():
+                                bundle_ok = True
+                        except Exception:
+                            pass
+                    if bundle_ok:
+                        self.lbl_google_embedded.config(text="✓ Найдены встроенные credentials.json (внутри exe) — указывать путь не нужно.", foreground="#1a7f37")
+                    else:
+                        self.lbl_google_embedded.config(text="○ Встроенные credentials.json не найдены — укажите путь или положите рядом с exe.", foreground="#b7791f")
+        except Exception:
+            pass
 
     def _browse_pdf_src(self):
         path = filedialog.askdirectory(title="Выберите папку с XLSX файлами")
