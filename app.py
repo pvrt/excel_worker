@@ -1302,8 +1302,11 @@ def process_pdf_merge(
     log_callback,
     progress_callback,
     finish_callback,
+    rotate_mode: str = "auto_zero",
 ):
-    """Фоновое объединение 2 PDF: весь pdf1 + выбранные страницы pdf2."""
+    """Фоновое объединение 2 PDF: весь pdf1 + выбранные страницы pdf2.
+    rotate_mode для PDF2: none / auto_zero / 90 / 180 / 270 / match_first
+    """
     try:
         p1 = Path(pdf1_path)
         p2 = Path(pdf2_path)
@@ -1346,6 +1349,30 @@ def process_pdf_merge(
             return
 
         log_callback(f"Выбрано из PDF2: {len(selected)} стр. -> {', '.join(str(i+1) for i in selected) if selected else '—'}")
+        # Режим поворота PDF2
+        rm = (rotate_mode or "auto_zero").strip().lower()
+        # Нормализация текста из комбобокса
+        if "оставить" in rm or rm == "none":
+            rot_mode = "none"
+        elif "270" in rm:
+            rot_mode = "270"
+        elif "90" in rm:
+            rot_mode = "90"
+        elif "180" in rm:
+            rot_mode = "180"
+        elif "выровнять" in rm or "match" in rm:
+            rot_mode = "match_first"
+        else:
+            rot_mode = "auto_zero"
+        ref_rotate = 0
+        if rot_mode == "match_first" and n1 > 0:
+            try:
+                ref_rotate = int(pdf1.pages[0].get("/Rotate", 0)) % 360
+            except Exception:
+                ref_rotate = 0
+            log_callback(f"Поворот PDF2: выравнивание под PDF1 ({ref_rotate}°)")
+        elif rot_mode != "none":
+            log_callback(f"Поворот PDF2: {rot_mode if rot_mode != 'auto_zero' else 'авто 0°'}")
         progress_callback(25)
 
         # Создаём новый PDF
@@ -1358,9 +1385,30 @@ def process_pdf_merge(
             if i % 10 == 0:
                 progress_callback(40 + int(30 * i / max(n1, 1)))
         progress_callback(70)
-        # Добавляем выбранные из pdf2
+        # Добавляем выбранные из pdf2 с учётом поворота
         for idx, page_idx in enumerate(selected, 1):
-            out_pdf.pages.append(pdf2.pages[page_idx])
+            src_page = pdf2.pages[page_idx]
+            # Применяем поворот до добавления (меняем копию в out)
+            out_pdf.pages.append(src_page)
+            if rot_mode != "none":
+                try:
+                    dst_page = out_pdf.pages[-1]
+                    cur = int(dst_page.get("/Rotate", 0)) % 360
+                    new_rot = cur
+                    if rot_mode == "auto_zero":
+                        new_rot = 0
+                    elif rot_mode == "90":
+                        new_rot = 90
+                    elif rot_mode == "180":
+                        new_rot = 180
+                    elif rot_mode == "270":
+                        new_rot = 270
+                    elif rot_mode == "match_first":
+                        new_rot = ref_rotate
+                    if new_rot != cur:
+                        dst_page.Rotate = new_rot
+                except Exception as e:
+                    log_callback(f"Предупреждение: не удалось повернуть стр. {page_idx+1}: {e}")
             if idx % 10 == 0 or idx == len(selected):
                 progress_callback(70 + int(20 * idx / max(len(selected), 1)))
 
@@ -2700,6 +2748,27 @@ class ExcelFinderApp(tk.Tk):
         ttk.Label(f_pages, text="  (пусто=все)", font=("Segoe UI", 8), foreground="#666").pack(side="left", padx=4)
         ttk.Label(frame_files, text='Примеры: 1  |  1,3,5  |  2-5  |  1,3,5-7  |  все', font=("Segoe UI", 8), foreground="#666").pack(anchor="w", padx=2)
 
+        # Поворот / выравнивание страниц PDF2
+        f_rot = ttk.Frame(frame_files)
+        f_rot.pack(fill="x", pady=(6, 2))
+        ttk.Label(f_rot, text="Поворот PDF 2:").pack(side="left", padx=(0, 5))
+        self.cmb_merge_rotate = ttk.Combobox(
+            f_rot,
+            state="readonly",
+            width=42,
+            values=[
+                "Оставить как есть",
+                "Авто - убрать поворот (0°)",
+                "Повернуть на 90°",
+                "Повернуть на 180°",
+                "Повернуть на 270°",
+                "Выровнять под PDF 1",
+            ],
+        )
+        self.cmb_merge_rotate.current(1)
+        self.cmb_merge_rotate.pack(side="left", fill="x", expand=True, padx=5)
+        ttk.Label(frame_files, text="Если страницы PDF 2 развернуты на 90°/180° — выберите Авто или нужный угол", font=("Segoe UI", 8), foreground="#666").pack(anchor="w", padx=2)
+
         # Выходной файл
         f_out = ttk.Frame(frame_files)
         f_out.pack(fill="x", pady=(8, 2))
@@ -2791,6 +2860,7 @@ class ExcelFinderApp(tk.Tk):
         pdf2 = self.ent_merge_pdf2.get().strip()
         out = self.ent_merge_output.get().strip()
         spec = self.ent_merge_pages.get().strip()
+        rotate_text = self.cmb_merge_rotate.get().strip() if hasattr(self, "cmb_merge_rotate") else "Авто - убрать поворот (0°)"
 
         if not pdf1 or not os.path.isfile(pdf1):
             messagebox.showwarning("Предупреждение", "Укажите корректный PDF 1!")
@@ -2819,6 +2889,7 @@ class ExcelFinderApp(tk.Tk):
                 lambda t: self.after(0, lambda: (self.txt_merge_log.insert(tk.END, t + "\n"), self.txt_merge_log.see(tk.END))),
                 lambda v: self.after(0, lambda: self.merge_progress.config(value=v)),
                 lambda s, m: self.after(0, lambda: self._on_merge_finish(s, m)),
+                rotate_text,
             ),
             daemon=True,
         ).start()
