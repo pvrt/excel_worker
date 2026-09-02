@@ -1303,8 +1303,10 @@ def process_pdf_merge(
     progress_callback,
     finish_callback,
     rotate_mode: str = "auto_zero",
+    **kwargs,
 ):
-    """Фоновое объединение 2 PDF: весь pdf1 + выбранные страницы pdf2.
+    """Фоновое объединение 2 PDF: выбранные страницы pdf1 + выбранные страницы pdf2.
+    pages_spec — для PDF2 (совместимость), pages_spec1 — для PDF1 (новый).
     rotate_mode для PDF2: none / auto_zero / 90 / 180 / 270 / match_first
     """
     try:
@@ -1340,15 +1342,26 @@ def process_pdf_merge(
         n2 = len(pdf2.pages)
         log_callback(f"PDF2 страниц: {n2}")
 
+        # pages_spec1 для PDF1 может прийти в kwargs (новый вызов), иначе пусто = все
+        pages_spec1 = kwargs.get("pages_spec1", kwargs.get("pages_spec_pdf1", ""))
+        pages_spec2 = pages_spec
         try:
-            selected = parse_page_spec(pages_spec, n2)
+            selected1 = parse_page_spec(pages_spec1, n1)
+        except ValueError as ve:
+            pdf1.close()
+            pdf2.close()
+            finish_callback(False, f"Ошибка в выборе страниц PDF1: {ve}\nФормат: 1,3,5-7 или пусто = все. Всего страниц: {n1}")
+            return
+        try:
+            selected2 = parse_page_spec(pages_spec2, n2)
         except ValueError as ve:
             pdf1.close()
             pdf2.close()
             finish_callback(False, f"Ошибка в выборе страниц PDF2: {ve}\nФормат: 1,3,5-7 или пусто = все. Всего страниц: {n2}")
             return
 
-        log_callback(f"Выбрано из PDF2: {len(selected)} стр. -> {', '.join(str(i+1) for i in selected) if selected else '—'}")
+        log_callback(f"Выбрано из PDF1: {len(selected1)} стр. -> {', '.join(str(i+1) for i in selected1) if selected1 else '—'}")
+        log_callback(f"Выбрано из PDF2: {len(selected2)} стр. -> {', '.join(str(i+1) for i in selected2) if selected2 else '—'}")
         # Режим поворота PDF2
         rm = (rotate_mode or "auto_zero").strip().lower()
         # Нормализация текста из комбобокса
@@ -1365,9 +1378,11 @@ def process_pdf_merge(
         else:
             rot_mode = "auto_zero"
         ref_rotate = 0
-        if rot_mode == "match_first" and n1 > 0:
+        if rot_mode == "match_first" and len(selected1) > 0:
             try:
-                ref_rotate = int(pdf1.pages[0].get("/Rotate", 0)) % 360
+                # берём первую выбранную страницу PDF1 как эталон
+                ref_idx = selected1[0]
+                ref_rotate = int(pdf1.pages[ref_idx].get("/Rotate", 0)) % 360
             except Exception:
                 ref_rotate = 0
             log_callback(f"Поворот PDF2: выравнивание под PDF1 ({ref_rotate}°)")
@@ -1379,14 +1394,14 @@ def process_pdf_merge(
         log_callback("Объединение...")
         progress_callback(40)
         out_pdf = pikepdf.Pdf.new()
-        # Копируем все страницы pdf1
-        for i, page in enumerate(pdf1.pages, 1):
-            out_pdf.pages.append(page)
+        # Копируем выбранные страницы pdf1
+        for i, page_idx in enumerate(selected1, 1):
+            out_pdf.pages.append(pdf1.pages[page_idx])
             if i % 10 == 0:
-                progress_callback(40 + int(30 * i / max(n1, 1)))
+                progress_callback(40 + int(30 * i / max(len(selected1), 1)))
         progress_callback(70)
         # Добавляем выбранные из pdf2 с учётом поворота
-        for idx, page_idx in enumerate(selected, 1):
+        for idx, page_idx in enumerate(selected2, 1):
             src_page = pdf2.pages[page_idx]
             # Применяем поворот до добавления (меняем копию в out)
             out_pdf.pages.append(src_page)
@@ -1409,8 +1424,8 @@ def process_pdf_merge(
                         dst_page.Rotate = new_rot
                 except Exception as e:
                     log_callback(f"Предупреждение: не удалось повернуть стр. {page_idx+1}: {e}")
-            if idx % 10 == 0 or idx == len(selected):
-                progress_callback(70 + int(20 * idx / max(len(selected), 1)))
+            if idx % 10 == 0 or idx == len(selected2):
+                progress_callback(70 + int(20 * idx / max(len(selected2), 1)))
 
         log_callback(f"Сохранение: {out}")
         progress_callback(95)
@@ -1419,9 +1434,10 @@ def process_pdf_merge(
         pdf1.close()
         pdf2.close()
         progress_callback(100)
-        log_callback(f"Готово! Итоговых страниц: {n1 + len(selected)}")
+        total_out = len(selected1) + len(selected2)
+        log_callback(f"Готово! Итоговых страниц: {total_out}")
 
-        finish_callback(True, f"Объединено!\nPDF1: {n1} стр.\nPDF2: {len(selected)} из {n2} стр.\nИтого: {n1 + len(selected)} стр.\nСохранено: {out}")
+        finish_callback(True, f"Объединено!\nPDF1: {len(selected1)} из {n1} стр.\nPDF2: {len(selected2)} из {n2} стр.\nИтого: {total_out} стр.\nСохранено: {out}")
 
     except Exception as e:
         log_callback(f"Критическая ошибка: {e}")
@@ -2710,23 +2726,32 @@ class ExcelFinderApp(tk.Tk):
 
         self._add_tab_description(
             self.tab_merge,
-            "Объедините два PDF в один: весь первый файл целиком + выбранные страницы из второго. "
-            "Укажите два PDF, выберите страницы второго (например: 1,3,5-7 или оставьте пусто — все), "
-            "и куда сохранить результат. Удобно, когда нужно приложить выборочные листы из второго документа.",
+            "Объедините два PDF в один: выберите нужные страницы из каждого файла и сохраните как один PDF. "
+            "Укажите два PDF, задайте страницы (например: 1,3,5-7 или пусто — все), "
+            "и куда сохранить результат. Удобно, когда нужно собрать выборочные листы.",
         )
 
         frame_files = ttk.LabelFrame(self.tab_merge, text=" 1. Выберите PDF файлы ", padding=10)
         frame_files.pack(fill="x", **pad_opts)
 
-        # PDF 1 — целиком
+        # PDF 1 — с выбором страниц
         f1 = ttk.Frame(frame_files)
         f1.pack(fill="x", pady=2)
-        ttk.Label(f1, text="PDF 1 (весь):", width=14).pack(side="left")
+        ttk.Label(f1, text="PDF 1:", width=14).pack(side="left")
         self.ent_merge_pdf1 = ttk.Entry(f1)
         self.ent_merge_pdf1.pack(side="left", fill="x", expand=True, padx=5)
         ttk.Button(f1, text="Обзор...", command=self._browse_merge_pdf1).pack(side="left", padx=2)
         self.lbl_merge_pdf1_pages = ttk.Label(frame_files, text="Страниц: —", font=("Segoe UI", 8), foreground="#666")
-        self.lbl_merge_pdf1_pages.pack(anchor="w", padx=2, pady=(0, 4))
+        self.lbl_merge_pdf1_pages.pack(anchor="w", padx=2, pady=(0, 2))
+
+        f_pages1 = ttk.Frame(frame_files)
+        f_pages1.pack(fill="x", pady=(2, 4))
+        ttk.Label(f_pages1, text="Страницы PDF 1:").pack(side="left", padx=(0, 5))
+        self.ent_merge_pages1 = ttk.Entry(f_pages1)
+        self.ent_merge_pages1.pack(side="left", fill="x", expand=True, padx=5)
+        self.ent_merge_pages1.insert(0, "")
+        ttk.Label(f_pages1, text="  (пусто=все)", font=("Segoe UI", 8), foreground="#666").pack(side="left", padx=4)
+        ttk.Label(frame_files, text='Примеры: 1  |  1,3,5  |  2-5  |  1,3,5-7  |  все', font=("Segoe UI", 8), foreground="#666").pack(anchor="w", padx=2, pady=(0, 4))
 
         # PDF 2 — с выбором страниц
         f2 = ttk.Frame(frame_files)
@@ -2859,7 +2884,13 @@ class ExcelFinderApp(tk.Tk):
         pdf1 = self.ent_merge_pdf1.get().strip()
         pdf2 = self.ent_merge_pdf2.get().strip()
         out = self.ent_merge_output.get().strip()
-        spec = self.ent_merge_pages.get().strip()
+        spec1 = self.ent_merge_pages1.get().strip() if hasattr(self, "ent_merge_pages1") else ""
+        # pdf2 pages entry is ent_merge_pages (совместимость) или ent_merge_pages2
+        if hasattr(self, "ent_merge_pages2"):
+            spec = self.ent_merge_pages2.get().strip()
+        else:
+            spec = self.ent_merge_pages.get().strip() if hasattr(self, "ent_merge_pages") else ""
+        # для обратной совместимости: если вдруг ent_merge_pages1 не существует, spec1 пусто
         rotate_text = self.cmb_merge_rotate.get().strip() if hasattr(self, "cmb_merge_rotate") else "Авто - убрать поворот (0°)"
 
         if not pdf1 or not os.path.isfile(pdf1):
@@ -2891,6 +2922,7 @@ class ExcelFinderApp(tk.Tk):
                 lambda s, m: self.after(0, lambda: self._on_merge_finish(s, m)),
                 rotate_text,
             ),
+            kwargs={"pages_spec1": spec1},
             daemon=True,
         ).start()
 
