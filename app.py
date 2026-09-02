@@ -2737,28 +2737,31 @@ class ExcelFinderApp(tk.Tk):
         self.frame_google = ttk.LabelFrame(self.tab_pdf, text=" Настройки Google Sheets ", padding=10)
         # не pack сразу, покажем по выбору движка
 
-        f_cred = ttk.Frame(self.frame_google)
-        f_cred.pack(fill="x", pady=2)
-        ttk.Label(f_cred, text="credentials.json:", width=18).pack(side="left")
-        self.ent_google_creds = ttk.Entry(f_cred)
+        self.frame_google_cred = ttk.Frame(self.frame_google)
+        self.frame_google_cred.pack(fill="x", pady=2)
+        ttk.Label(self.frame_google_cred, text="credentials.json:", width=18).pack(side="left")
+        self.ent_google_creds = ttk.Entry(self.frame_google_cred)
         self.ent_google_creds.pack(side="left", fill="x", expand=True, padx=5)
         # по умолчанию credentials.json рядом с exe/app.py
         default_cred = str(_get_app_dir() / "credentials.json")
         self.ent_google_creds.insert(0, default_cred)
-        ttk.Button(f_cred, text="Обзор...", command=self._browse_google_creds).pack(side="left", padx=2)
+        ttk.Button(self.frame_google_cred, text="Обзор...", command=self._browse_google_creds).pack(side="left", padx=2)
 
-        f_tok = ttk.Frame(self.frame_google)
-        f_tok.pack(fill="x", pady=2)
-        ttk.Label(f_tok, text="token.json:", width=18).pack(side="left")
-        self.ent_google_token = ttk.Entry(f_tok)
+        self.frame_google_token = ttk.Frame(self.frame_google)
+        self.frame_google_token.pack(fill="x", pady=2)
+        ttk.Label(self.frame_google_token, text="token.json:", width=18).pack(side="left")
+        self.ent_google_token = ttk.Entry(self.frame_google_token)
         self.ent_google_token.pack(side="left", fill="x", expand=True, padx=5)
         default_tok = str(_get_app_dir() / "token.json")
         self.ent_google_token.insert(0, default_tok)
-        ttk.Button(f_tok, text="Обзор...", command=self._browse_google_token).pack(side="left", padx=2)
+        ttk.Button(self.frame_google_token, text="Обзор...", command=self._browse_google_token).pack(side="left", padx=2)
 
         # Статус встроенных credentials
         self.lbl_google_embedded = ttk.Label(self.frame_google, text="", font=("Segoe UI", 8, "bold"), wraplength=760, justify="left")
         self.lbl_google_embedded.pack(anchor="w", pady=(6, 0))
+        self._google_settings_visible = False
+        self.btn_google_toggle = ttk.Button(self.frame_google, text="Показать пути к json", command=self._toggle_google_settings)
+        self.btn_google_toggle.pack(anchor="w", pady=(2, 0))
         # Обновим статус после создания виджетов
         self.after(100, self._update_google_embedded_status)
 
@@ -3091,7 +3094,39 @@ class ExcelFinderApp(tk.Tk):
         try:
             cred = self.ent_google_creds.get().strip() if hasattr(self, "ent_google_creds") else str(_get_app_dir() / "credentials.json")
             resolved = _resolve_google_path(cred) if cred else ""
+            has_cred = False
             if resolved and os.path.isfile(resolved):
+                has_cred = True
+            else:
+                app_cred = _get_app_dir() / "credentials.json"
+                if app_cred.is_file():
+                    has_cred = True
+                    resolved = str(app_cred)
+                elif getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+                    try:
+                        bundle_p = Path(sys._MEIPASS) / "credentials.json"  # type: ignore[attr-defined]
+                        if bundle_p.is_file():
+                            has_cred = True
+                            resolved = str(bundle_p)
+                    except Exception:
+                        pass
+            # управляем видимостью полей
+            show_fields = not has_cred or getattr(self, "_google_settings_visible", False)
+            try:
+                if show_fields:
+                    # показать перед статусом
+                    self.frame_google_cred.pack(fill="x", pady=2, before=self.lbl_google_embedded)
+                    self.frame_google_token.pack(fill="x", pady=2, before=self.lbl_google_embedded)
+                    if hasattr(self, "btn_google_toggle"):
+                        self.btn_google_toggle.config(text="Скрыть пути к json")
+                else:
+                    self.frame_google_cred.pack_forget()
+                    self.frame_google_token.pack_forget()
+                    if hasattr(self, "btn_google_toggle"):
+                        self.btn_google_toggle.config(text="Показать пути к json (изменить)")
+            except Exception:
+                pass
+            if has_cred:
                 try:
                     import json
 
@@ -3102,25 +3137,13 @@ class ExcelFinderApp(tk.Tk):
                 except Exception:
                     self.lbl_google_embedded.config(text="✓ Найдены credentials.json — указывать путь не нужно.", foreground="#1a7f37")
             else:
-                app_cred = _get_app_dir() / "credentials.json"
-                if app_cred.is_file():
-                    self.lbl_google_embedded.config(text="✓ Найдены встроенные credentials.json — указывать путь не нужно.", foreground="#1a7f37")
-                else:
-                    # также проверяем bundle
-                    bundle_ok = False
-                    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-                        try:
-                            bundle_p = Path(sys._MEIPASS) / "credentials.json"  # type: ignore[attr-defined]
-                            if bundle_p.is_file():
-                                bundle_ok = True
-                        except Exception:
-                            pass
-                    if bundle_ok:
-                        self.lbl_google_embedded.config(text="✓ Найдены встроенные credentials.json (внутри exe) — указывать путь не нужно.", foreground="#1a7f37")
-                    else:
-                        self.lbl_google_embedded.config(text="○ Встроенные credentials.json не найдены — укажите путь или положите рядом с exe.", foreground="#b7791f")
+                self.lbl_google_embedded.config(text="○ Встроенные credentials.json не найдены — укажите путь или положите рядом с exe.", foreground="#b7791f")
         except Exception:
             pass
+
+    def _toggle_google_settings(self):
+        self._google_settings_visible = not getattr(self, "_google_settings_visible", False)
+        self._update_google_embedded_status()
 
     def _browse_pdf_src(self):
         path = filedialog.askdirectory(title="Выберите папку с XLSX файлами")
