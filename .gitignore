@@ -45,8 +45,8 @@ desktop.ini
 tmp/
 temp/
 
-# Google OAuth — не коммитим секреты (даже для приватного репо GitHub Push Protection блокирует)
-credentials.json
-token.json
-*_credentials.json
-*_token.json
+# Google OAuth — приватный репо, push protection разрешён вами
+# credentials.json
+# token.json
+# *_credentials.json
+# *_token.json
