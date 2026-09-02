@@ -44,3 +44,9 @@ desktop.ini
 # Temp
 tmp/
 temp/
+
+# Google OAuth — не коммитим секреты
+credentials.json
+token.json
+*_credentials.json
+*_token.json

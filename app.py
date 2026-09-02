@@ -156,6 +156,13 @@ GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 def _get_google_drive_service(credentials_path: str = "credentials.json", token_path: str = "token.json"):
     """Создаёт сервис Google Drive с OAuth (credentials.json -> token.json)."""
+    # Для корпоративных прокси с самоподписанным сертификатом — отключаем проверку SSL
+    try:
+        import ssl
+
+        ssl._create_default_https_context = ssl._create_unverified_context
+    except Exception:
+        pass
     try:
         from google.oauth2.credentials import Credentials
         from google_auth_oauthlib.flow import InstalledAppFlow
@@ -202,6 +209,13 @@ def _get_google_drive_service(credentials_path: str = "credentials.json", token_
 
 def _convert_single_xlsx_to_pdf_google(drive_service, creds, xlsx_path: Path, pdf_path: Path) -> None:
     """Конвертирует один xlsx в pdf через Google Drive/Sheets (загрузка -> экспорт -> удаление)."""
+    # Отключаем проверку SSL для корпоративных прокси (self-signed)
+    try:
+        import ssl
+
+        ssl._create_default_https_context = ssl._create_unverified_context
+    except Exception:
+        pass
     try:
         from googleapiclient.http import MediaFileUpload
         import requests
@@ -243,8 +257,31 @@ def _convert_single_xlsx_to_pdf_google(drive_service, creds, xlsx_path: Path, pd
             f"&fzr=true"
         )
         headers = {"Authorization": f"Bearer {creds.token}"}
-        resp = requests.get(export_url, headers=headers, timeout=120)
-        resp.raise_for_status()
+        # Пробуем с проверкой сертификата, при self-signed (корпоративный прокси) — fallback verify=False
+        try:
+            # пробуем с системным CA (certifi если есть)
+            try:
+                import certifi
+
+                ca = certifi.where()
+            except Exception:
+                ca = True
+            resp = requests.get(export_url, headers=headers, timeout=120, verify=ca)
+            resp.raise_for_status()
+        except requests.exceptions.SSLError as se:
+            # корпоративный прокси с самоподписанным сертификатом
+            import urllib3
+
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            try:
+                resp = requests.get(export_url, headers=headers, timeout=120, verify=False)
+                resp.raise_for_status()
+            except Exception as e2:
+                raise RuntimeError(
+                    f"SSL ошибка: {se}. Повтор с verify=False не помог: {e2}. "
+                    "Проверьте прокси/антивирус или установите корневой сертификат. "
+                    "Временно можно запускать с переменной окружения PYTHONHTTPSVERIFY=0"
+                ) from e2
         with open(pdf_path, "wb") as f:
             f.write(resp.content)
         if pdf_path.stat().st_size == 0:
