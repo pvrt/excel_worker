@@ -2764,12 +2764,12 @@ class ExcelFinderApp(tk.Tk):
                 _cand_cred = str(_get_app_dir() / "credentials.json")
         default_cred = _cand_cred
         self.ent_google_creds.insert(0, default_cred)
-        ttk.Button(f_cred, text="Обзор...", command=self._browse_google_creds).pack(side="left", padx=2)
+        ttk.Button(self.frame_google_cred, text="Обзор...", command=self._browse_google_creds).pack(side="left", padx=2)
 
-        f_tok = ttk.Frame(self.frame_google)
-        f_tok.pack(fill="x", pady=2)
-        ttk.Label(f_tok, text="token.json:", width=18).pack(side="left")
-        self.ent_google_token = ttk.Entry(f_tok)
+        self.frame_google_token = ttk.Frame(self.frame_google)
+        self.frame_google_token.pack(fill="x", pady=2)
+        ttk.Label(self.frame_google_token, text="token.json:", width=18).pack(side="left")
+        self.ent_google_token = ttk.Entry(self.frame_google_token)
         self.ent_google_token.pack(side="left", fill="x", expand=True, padx=5)
         _cand_tok = _resolve_google_path(str(_get_app_dir() / "token.json"))
         if not os.path.isfile(_cand_tok):
