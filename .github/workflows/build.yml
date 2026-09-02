@@ -57,24 +57,24 @@ jobs:
 
   # Опционально: авто-релиз на каждый пуш в main (создаёт тег v0.0.<run_number>)
   # Раскомментируйте если хотите релиз на каждый коммит в main без ручных тегов
-  # auto-release:
-  #   if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-  #   needs: build
-  #   runs-on: windows-latest
-  #   permissions:
-  #     contents: write
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/download-artifact@v4
-  #       with:
-  #         name: ExcelWorker-windows
-  #         path: dist
-  #     - name: Create auto tag release
-  #       uses: softprops/action-gh-release@v2
-  #       with:
-  #         tag_name: v0.0.${{ github.run_number }}
-  #         name: "Auto build ${{ github.run_number }}"
-  #         files: dist/ExcelWorker.exe
-  #         generate_release_notes: true
-  #       env:
-  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  auto-release:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ExcelWorker-windows
+          path: dist
+      - name: Create auto tag release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.0.${{ github.run_number }}
+          name: "Auto build ${{ github.run_number }}"
+          files: dist/ExcelWorker.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
