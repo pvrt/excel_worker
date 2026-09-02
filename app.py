@@ -111,6 +111,63 @@ def find_soffice_executable() -> str | None:
     return None
 
 
+def _is_excel_available() -> bool:
+    """Проверяет, доступен ли Microsoft Excel через COM (только Windows)."""
+    if platform.system() != "Windows":
+        return False
+    # Проверка через реестр
+    try:
+        import winreg
+
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"Excel.Application")
+            winreg.CloseKey(key)
+            return True
+        except FileNotFoundError:
+            pass
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"CLSID\{00024500-0000-0000-C000-000000000046}")
+            winreg.CloseKey(key)
+            return True
+        except FileNotFoundError:
+            pass
+    except Exception:
+        pass
+    # Проверка наличия EXCEL.EXE в стандартных путях
+    excel_paths = [
+        r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE",
+        r"C:\Program Files (x86)\Microsoft Office\root\Office16\EXCEL.EXE",
+        r"C:\Program Files\Microsoft Office\Office16\EXCEL.EXE",
+        r"C:\Program Files (x86)\Microsoft Office\Office16\EXCEL.EXE",
+        r"C:\Program Files\Microsoft Office\root\Office15\EXCEL.EXE",
+        r"C:\Program Files\Microsoft Office\Office15\EXCEL.EXE",
+    ]
+    for p in excel_paths:
+        if os.path.isfile(p):
+            return True
+    # Последняя попытка — где лежит excel через PATH/which (редко)
+    if shutil.which("excel") or shutil.which("EXCEL.EXE"):
+        return True
+    return False
+
+
+def _convert_single_xlsx_to_pdf_excel(excel_app, xlsx_path: Path, pdf_path: Path) -> None:
+    """Конвертирует один xlsx в pdf через уже запущенный Excel COM-объект."""
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    # Excel требует абсолютные пути
+    abs_src = str(xlsx_path.resolve())
+    abs_dst = str(pdf_path.resolve())
+    wb = excel_app.Workbooks.Open(abs_src)
+    try:
+        # 0 = xlTypePDF, Quality 0 = standard
+        wb.ExportAsFixedFormat(0, abs_dst)
+    finally:
+        try:
+            wb.Close(False)
+        except Exception:
+            pass
+
+
 def _convert_single_xlsx_to_pdf_libreoffice(
     soffice: str, xlsx_path: Path, out_dir: Path, timeout: int = 90
 ) -> Path | None:
@@ -657,22 +714,58 @@ def process_xlsx_to_pdf(
 
         soffice = find_soffice_executable()
         use_libre = soffice is not None
-        if use_libre:
-            log_callback(f"Используется LibreOffice: {soffice}")
-        else:
-            # Проверяем reportlab
-            try:
-                import reportlab  # noqa: F401
+        use_excel = False
+        excel_app = None
+        excel_checked = False
 
-                log_callback("LibreOffice не найден — будет использован reportlab (упрощённая конвертация)")
-            except ImportError:
-                finish_callback(
-                    False,
-                    "Не найден LibreOffice (soffice) и не установлен reportlab.\n"
-                    "Установите LibreOffice с https://www.libreoffice.org/ \n"
-                    "или выполните: pip install reportlab",
-                )
-                return
+        if use_libre:
+            log_callback(f"Используется LibreOffice: {soffice} — точная конвертация")
+        else:
+            # Пробуем Microsoft Excel (COM)
+            if _is_excel_available():
+                try:
+                    import win32com.client
+                    import pythoncom
+
+                    pythoncom.CoInitialize()
+                    # Пробуем создать экземпляр Excel
+                    excel_app = win32com.client.DispatchEx("Excel.Application")
+                    excel_app.Visible = False
+                    excel_app.DisplayAlerts = False
+                    try:
+                        excel_app.ScreenUpdating = False
+                    except Exception:
+                        pass
+                    use_excel = True
+                    excel_checked = True
+                    log_callback("LibreOffice не найден — будет использован Microsoft Excel (COM) — точная конвертация")
+                except Exception as e:
+                    log_callback(f"Microsoft Excel найден, но не удалось запустить: {e}")
+                    try:
+                        if excel_app is not None:
+                            excel_app.Quit()
+                    except Exception:
+                        pass
+                    excel_app = None
+                    use_excel = False
+            if not use_excel:
+                # Проверяем reportlab как fallback
+                try:
+                    import reportlab  # noqa: F401
+
+                    if excel_checked:
+                        log_callback("Будет использован reportlab (упрощённая табличная конвертация)")
+                    else:
+                        log_callback("LibreOffice и Excel не найдены — будет использован reportlab (упрощённая табличная конвертация)")
+                except ImportError:
+                    finish_callback(
+                        False,
+                        "Не найден LibreOffice (soffice), недоступен Microsoft Excel и не установлен reportlab.\n"
+                        "Установите LibreOffice с https://www.libreoffice.org/\n"
+                        "или убедитесь что установлен Microsoft Excel,\n"
+                        "или выполните: pip install reportlab",
+                    )
+                    return
 
         # Для плоского режима — один общий set, для структуры — по папкам
         used_names_per_dir: dict[str, set[str]] = {}
@@ -747,6 +840,13 @@ def process_xlsx_to_pdf(
                     except ValueError:
                         rel_out = target_pdf.name
                     log_callback(f"[{idx}/{total}] OK: {fpath.name} -> {rel_out}")
+                elif use_excel:
+                    _convert_single_xlsx_to_pdf_excel(excel_app, fpath, target_pdf)
+                    try:
+                        rel_out = str(target_pdf.relative_to(out))
+                    except ValueError:
+                        rel_out = target_pdf.name
+                    log_callback(f"[{idx}/{total}] OK (Excel): {fpath.name} -> {rel_out}")
                 else:
                     _convert_single_xlsx_to_pdf_reportlab(fpath, target_pdf)
                     try:
@@ -762,13 +862,44 @@ def process_xlsx_to_pdf(
 
             progress_callback(int((idx / total) * 100))
 
+        # Корректно закрываем Excel, если использовали
+        if excel_app is not None:
+            try:
+                excel_app.Quit()
+            except Exception:
+                pass
+            try:
+                import pythoncom
+
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
         msg = f"Конвертация завершена!\nУспешно: {success} из {total}"
         if errors:
             msg += f"\nОшибок: {errors}"
         msg += f"\nПапка с PDF: {out}"
+        if use_libre:
+            msg += "\nДвижок: LibreOffice"
+        elif use_excel:
+            msg += "\nДвижок: Microsoft Excel"
+        else:
+            msg += "\nДвижок: reportlab (упрощённо)"
         finish_callback(True, msg)
 
     except Exception as e:
+        # Пытаемся закрыть Excel даже при критической ошибке
+        try:
+            if "excel_app" in locals() and excel_app is not None:
+                excel_app.Quit()
+        except Exception:
+            pass
+        try:
+            import pythoncom
+
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
         log_callback(f"Критическая ошибка: {e}")
         finish_callback(False, str(e))
 
@@ -1832,7 +1963,7 @@ class ExcelFinderApp(tk.Tk):
             "Выберите, как называть PDF: 1) по имени исходного Excel-файла (report.xlsx -> report.pdf) или 2) по имени папки, где лежит файл "
             "(папка_123/report.xlsx -> папка_123.pdf — удобно, когда в каждой подпапке один файл). "
             "Галочка «Сохранять структуру папок» — создаст в выходной папке такие же подпапки, как в исходной; без неё все PDF лягут в одну папку. "
-            "При совпадении имён добавится _1, _2. Форматирование сохраняется через LibreOffice.",
+            "При совпадении имён добавится _1, _2. Приоритет движков: LibreOffice → Microsoft Excel (если LibreOffice не установлен) → reportlab (упрощённо).",
         )
 
         frame_paths = ttk.LabelFrame(
@@ -1901,15 +2032,43 @@ class ExcelFinderApp(tk.Tk):
             justify="left",
         ).pack(anchor="w", padx=(26, 0), pady=(0, 2))
 
-        # Инфо о движке
+        # Инфо о движке — приоритет: LibreOffice → Excel → reportlab
         soffice_path = find_soffice_executable()
+        excel_ok = _is_excel_available()
+        lines = []
         if soffice_path:
-            engine_info = f"Движок: LibreOffice найдено ({soffice_path}) — точная конвертация с сохранением форматирования."
+            lines.append(f"✓ LibreOffice: найдено ({soffice_path})")
+        else:
+            lines.append("✗ LibreOffice: не найдено")
+        if excel_ok:
+            lines.append("✓ Microsoft Excel: доступен (COM)")
+        else:
+            if platform.system() == "Windows":
+                lines.append("✗ Microsoft Excel: не найден")
+            else:
+                lines.append("— Microsoft Excel: доступен только на Windows")
+
+        if soffice_path:
+            engine_info = " | ".join(lines) + "  →  будет использован LibreOffice (точная конвертация, приоритет)."
+            fg = "#1a7f37"
+        elif excel_ok:
+            engine_info = " | ".join(lines) + "  →  будет использован Microsoft Excel (точная конвертация через COM)."
             fg = "#1a7f37"
         else:
-            engine_info = "Движок: LibreOffice не найдено — установите LibreOffice или выполните: pip install reportlab (упрощённая таблица)."
-            fg = "#c0392b"
-        ttk.Label(frame_naming, text=engine_info, font=("Segoe UI", 8), foreground=fg, wraplength=780).pack(
+            # проверяем reportlab
+            try:
+                import reportlab  # noqa: F401
+
+                has_rl = True
+            except ImportError:
+                has_rl = False
+            if has_rl:
+                engine_info = " | ".join(lines) + "  →  будет использован reportlab (упрощённая табличная конвертация без сохранения форматирования)."
+                fg = "#b7791f"
+            else:
+                engine_info = " | ".join(lines) + "  →  нет доступных движков. Установите LibreOffice (https://www.libreoffice.org/) или Microsoft Excel, или выполните: pip install reportlab."
+                fg = "#c0392b"
+        ttk.Label(frame_naming, text=engine_info, font=("Segoe UI", 8), foreground=fg, wraplength=780, justify="left").pack(
             anchor="w", pady=(4, 0)
         )
 

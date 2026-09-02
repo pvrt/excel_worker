@@ -1,6 +1,8 @@
 openpyxl==3.1.5
 et_xmlfile==2.0.0
-# Опционально для fallback конвертации XLSX->PDF без LibreOffice
-# reportlab==4.2.0
+# Для конвертации XLSX->PDF: LibreOffice приоритет, затем Excel, затем reportlab
+reportlab==4.2.0
+# pywin32 нужен только на Windows для работы через Microsoft Excel COM
+pywin32==312; platform_system == "Windows"
 # Для сборки
 pyinstaller==6.22.2
