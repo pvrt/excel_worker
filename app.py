@@ -2316,8 +2316,8 @@ class ExcelFinderApp(tk.Tk):
         # Ряд: 1. Папки | 2. Как называть (в одну строку)
         top_row = ttk.Frame(self.tab_pdf)
         top_row.pack(fill="x", padx=10, pady=5)
-        top_row.columnconfigure(0, weight=1)
-        top_row.columnconfigure(1, weight=1)
+        top_row.columnconfigure(0, weight=1, uniform="pdf_top")
+        top_row.columnconfigure(1, weight=1, uniform="pdf_top")
 
         frame_paths = ttk.LabelFrame(top_row, text=" 1. Папки ", padding=10)
         frame_paths.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
