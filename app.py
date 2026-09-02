@@ -3060,19 +3060,51 @@ class ExcelFinderApp(tk.Tk):
             messagebox.showerror("Ошибка", msg)
 
     def _on_pdf_engine_changed(self):
-        """Показывает/скрывает настройки Google в зависимости от выбранного движка."""
+        """Показывает/скрывает настройки Google. Если credentials встроены — не показываем ничего."""
         if not hasattr(self, "frame_google") or not hasattr(self, "var_pdf_engine"):
             return
         eng = self.var_pdf_engine.get()
-        if eng == "google":
-            # Показать перед кнопкой запуска
-            try:
-                self.frame_google.pack(fill="x", padx=10, pady=5, before=self.btn_pdf_run)
-            except Exception:
-                self.frame_google.pack(fill="x", padx=10, pady=5)
-            self._update_google_embedded_status()
-        else:
+        if eng != "google":
             self.frame_google.pack_forget()
+            return
+        # Для Google проверяем, есть ли встроенные/найденные credentials
+        try:
+            cred_path = self.ent_google_creds.get().strip() if hasattr(self, "ent_google_creds") else str(_get_app_dir() / "credentials.json")
+            resolved = _resolve_google_path(cred_path) if cred_path else ""
+            has_cred = resolved and os.path.isfile(resolved)
+            if not has_cred:
+                # пробуем найти рядом с exe/bundle
+                for cand in [str(_get_app_dir() / "credentials.json"), "credentials.json"]:
+                    cand_res = _resolve_google_path(cand)
+                    if cand_res and os.path.isfile(cand_res):
+                        has_cred = True
+                        break
+                # также bundle
+                if not has_cred and getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+                    try:
+                        b = Path(sys._MEIPASS) / "credentials.json"  # type: ignore[attr-defined]
+                        if b.is_file():
+                            has_cred = True
+                    except Exception:
+                        pass
+            try:
+                import googleapiclient  # noqa: F401
+
+                has_lib = True
+            except ImportError:
+                has_lib = False
+            # Если всё готово — не показываем настройки вообще, просто работаем
+            if has_cred and has_lib:
+                self.frame_google.pack_forget()
+                return
+        except Exception:
+            pass
+        # Иначе показываем настройки (нет встроенных)
+        try:
+            self.frame_google.pack(fill="x", padx=10, pady=5, before=self.btn_pdf_run)
+        except Exception:
+            self.frame_google.pack(fill="x", padx=10, pady=5)
+        self._update_google_embedded_status()
 
     def _browse_google_creds(self):
         path = filedialog.askopenfilename(title="Выберите credentials.json", filetypes=[("JSON", "*.json"), ("All", "*.*")])
