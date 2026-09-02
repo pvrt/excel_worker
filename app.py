@@ -200,19 +200,85 @@ def _convert_single_xlsx_to_pdf_libreoffice(
     """Конвертирует один xlsx в pdf через LibreOffice, возвращает путь к созданному pdf.
 
     Использует временную папку чтобы избежать коллизий при одинаковых stem.
+    Перед конвертацией создаёт временную копию с подрезанной областью печати,
+    чтобы убрать 2-3x пустого места после таблицы (часто из-за форматирования далёких ячеек).
     """
     import tempfile
     import time
+    from openpyxl.utils import get_column_letter
 
     # Создаём временную папку для промежуточного pdf
     tmpdir = Path(tempfile.mkdtemp(prefix="xlsx2pdf_"))
+    # Подготавливаем копию с корректной областью печати
+    prep_path = tmpdir / xlsx_path.name
+    src_for_convert = xlsx_path
+    try:
+        shutil.copy2(str(xlsx_path), str(prep_path))
+        try:
+            wb = openpyxl.load_workbook(prep_path)
+            for ws in wb.worksheets:
+                # Находим последнюю непустую строку/колонку по значениям (как для reportlab)
+                last_row = 0
+                last_col = 0
+                for r_idx, row in enumerate(ws.iter_rows(values_only=True), 1):
+                    has = False
+                    c_idx_last = 0
+                    for c_idx, v in enumerate(row, 1):
+                        if v is not None and str(v).strip() != "":
+                            has = True
+                            c_idx_last = c_idx
+                    if has:
+                        last_row = r_idx
+                        if c_idx_last > last_col:
+                            last_col = c_idx_last
+                # Учитываем merged cells
+                try:
+                    for rng in ws.merged_cells.ranges:
+                        if rng.max_row > last_row:
+                            last_row = rng.max_row
+                        if rng.max_col > last_col:
+                            last_col = rng.max_col
+                except Exception:
+                    pass
+                if last_row > 0 and last_col > 0:
+                    # Ограничиваем, чтобы не резать заголовки/подписи внизу (если они есть)
+                    # но убираем далёкий форматированный хвост (4705 -> реально 4705 и есть данные, так что оставим)
+                    # Ставим область печати A1:Last
+                    try:
+                        ws.print_area = f"A1:{get_column_letter(last_col)}{last_row}"
+                    except Exception:
+                        pass
+                    # Настраиваем страницу, чтобы в PDF не было 2-3x пустого хвоста и страниц
+                    try:
+                        # Сохраняем оригинальный масштаб/фит, если уже задан (например scale=54 у файла 375)
+                        has_scale = ws.page_setup.scale not in (None, 0)
+                        has_fit = ws.page_setup.fitToWidth not in (None, 0) or ws.page_setup.fitToHeight not in (None, 0)
+                        if not has_scale and not has_fit:
+                            ws.page_setup.fitToWidth = 1
+                            ws.page_setup.fitToHeight = 0
+                            ws.sheet_properties.pageSetUpPr.fitToPage = True
+                        if not ws.page_setup.orientation:
+                            ws.page_setup.orientation = "landscape" if last_col > 6 else "portrait"
+                        if not ws.page_setup.paperSize:
+                            ws.page_setup.paperSize = ws.PAPERSIZE_A4
+                    except Exception:
+                        pass
+            wb.save(prep_path)
+            wb.close()
+            src_for_convert = prep_path
+        except Exception:
+            # Если не удалось подготовить — используем оригинал
+            src_for_convert = xlsx_path
+    except Exception:
+        src_for_convert = xlsx_path
+
     try:
         expected = tmpdir / f"{xlsx_path.stem}.pdf"
         # Используем calc_pdf_Export с IsSkipEmptyPages, чтобы не плодить пустые страницы/листы
         # Для .xls/.xlsx это Calc; для других типов LibreOffice сам выберет фильтр, но указание calc безопасно
         convert_filter = "pdf:calc_pdf_Export:IsSkipEmptyPages=true;SelectPdfVersion=1"
         result = subprocess.run(
-            [soffice, "--headless", "--convert-to", convert_filter, "--outdir", str(tmpdir), str(xlsx_path)],
+            [soffice, "--headless", "--convert-to", convert_filter, "--outdir", str(tmpdir), str(src_for_convert)],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -220,7 +286,7 @@ def _convert_single_xlsx_to_pdf_libreoffice(
         # Fallback без опций, если фильтр не поддерживается старой версией
         if result.returncode != 0 and "Error" in (result.stderr or ""):
             result = subprocess.run(
-                [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(tmpdir), str(xlsx_path)],
+                [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(tmpdir), str(src_for_convert)],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -738,6 +804,7 @@ def process_xlsx_to_pdf(
     progress_callback,
     finish_callback,
     keep_structure: bool = False,
+    engine: str = "auto",
 ):
     """Фоновая конвертация папки с xlsx в pdf с выбором схемы именования.
 
@@ -747,6 +814,11 @@ def process_xlsx_to_pdf(
     keep_structure:
         True — сохранять структуру подпапок (out/подпапка/файл.pdf)
         False — складывать все PDF плоско в одну папку
+    engine:
+        'auto' — LibreOffice → Excel → reportlab (приоритет)
+        'libre' — только LibreOffice
+        'excel' — только Microsoft Excel (COM)
+        'reportlab' — только reportlab (упрощённо)
     """
     try:
         src = Path(source_dir)
@@ -771,22 +843,65 @@ def process_xlsx_to_pdf(
         log_callback(f"Структура папок: {'сохранять' if keep_structure else 'плоско (в одну папку)'}")
 
         soffice = find_soffice_executable()
-        use_libre = soffice is not None
+        use_libre = False
         use_excel = False
         excel_app = None
-        excel_checked = False
+        engine = (engine or "auto").lower()
+        log_callback(f"Выбран движок: {engine}")
 
-        if use_libre:
-            log_callback(f"Используется LibreOffice: {soffice} — точная конвертация")
-        else:
-            # Пробуем Microsoft Excel (COM)
-            if _is_excel_available():
+        if engine == "libre":
+            if soffice:
+                use_libre = True
+                log_callback(f"Используется LibreOffice: {soffice} — точная конвертация")
+            else:
+                finish_callback(False, "LibreOffice не найден.\nУстановите LibreOffice с https://www.libreoffice.org/\nили выберите другой движок (Excel/reportlab).")
+                return
+        elif engine == "excel":
+            if not _is_excel_available():
+                finish_callback(False, "Microsoft Excel не найден или недоступен через COM.\nУбедитесь, что Excel установлен на Windows.")
+                return
+            try:
+                import win32com.client
+                import pythoncom
+
+                pythoncom.CoInitialize()
+                excel_app = win32com.client.DispatchEx("Excel.Application")
+                excel_app.Visible = False
+                excel_app.DisplayAlerts = False
+                try:
+                    excel_app.ScreenUpdating = False
+                except Exception:
+                    pass
+                use_excel = True
+                log_callback("Используется Microsoft Excel (COM) — точная конвертация")
+            except Exception as e:
+                log_callback(f"Не удалось запустить Excel: {e}")
+                try:
+                    if excel_app is not None:
+                        excel_app.Quit()
+                except Exception:
+                    pass
+                excel_app = None
+                finish_callback(False, f"Ошибка запуска Excel: {e}")
+                return
+        elif engine == "reportlab":
+            try:
+                import reportlab  # noqa: F401
+
+                log_callback("Используется reportlab (упрощённая табличная конвертация)")
+            except ImportError:
+                finish_callback(False, "Не установлен reportlab.\nВыполните: pip install reportlab")
+                return
+        else:  # auto
+            if soffice:
+                use_libre = True
+                log_callback(f"Используется LibreOffice: {soffice} — точная конвертация (приоритет)")
+            elif _is_excel_available():
                 try:
                     import win32com.client
                     import pythoncom
 
                     pythoncom.CoInitialize()
-                    # Пробуем создать экземпляр Excel
                     excel_app = win32com.client.DispatchEx("Excel.Application")
                     excel_app.Visible = False
                     excel_app.DisplayAlerts = False
@@ -795,7 +910,6 @@ def process_xlsx_to_pdf(
                     except Exception:
                         pass
                     use_excel = True
-                    excel_checked = True
                     log_callback("LibreOffice не найден — будет использован Microsoft Excel (COM) — точная конвертация")
                 except Exception as e:
                     log_callback(f"Microsoft Excel найден, но не удалось запустить: {e}")
@@ -806,15 +920,24 @@ def process_xlsx_to_pdf(
                         pass
                     excel_app = None
                     use_excel = False
-            if not use_excel:
-                # Проверяем reportlab как fallback
+                    try:
+                        import reportlab  # noqa: F401
+
+                        log_callback("Будет использован reportlab (упрощённая табличная конвертация)")
+                    except ImportError:
+                        finish_callback(
+                            False,
+                            "Не найден LibreOffice (soffice), недоступен Microsoft Excel и не установлен reportlab.\n"
+                            "Установите LibreOffice с https://www.libreoffice.org/\n"
+                            "или убедитесь что установлен Microsoft Excel,\n"
+                            "или выполните: pip install reportlab",
+                        )
+                        return
+            else:
                 try:
                     import reportlab  # noqa: F401
 
-                    if excel_checked:
-                        log_callback("Будет использован reportlab (упрощённая табличная конвертация)")
-                    else:
-                        log_callback("LibreOffice и Excel не найдены — будет использован reportlab (упрощённая табличная конвертация)")
+                    log_callback("LibreOffice и Excel не найдены — будет использован reportlab (упрощённая табличная конвертация)")
                 except ImportError:
                     finish_callback(
                         False,
@@ -2091,7 +2214,17 @@ class ExcelFinderApp(tk.Tk):
             justify="left",
         ).pack(anchor="w", padx=(26, 0), pady=(0, 2))
 
-        # Инфо о движке — приоритет: LibreOffice → Excel → reportlab
+        # Выбор движка
+        frame_engine = ttk.LabelFrame(self.tab_pdf, text=" 3. Движок конвертации ", padding=10)
+        frame_engine.pack(fill="x", **pad_opts)
+
+        self.var_pdf_engine = tk.StringVar(value="auto")
+        ttk.Radiobutton(frame_engine, text="Авто (рекомендуется) — LibreOffice → Excel → reportlab", value="auto", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
+        ttk.Radiobutton(frame_engine, text="Только LibreOffice (точная, сохраняет форматирование)", value="libre", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
+        ttk.Radiobutton(frame_engine, text="Только Microsoft Excel (точная, через COM — нужен Excel)", value="excel", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
+        ttk.Radiobutton(frame_engine, text="Только reportlab (упрощённая таблица, без Excel/LibreOffice)", value="reportlab", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
+
+        # Инфо о доступных движках
         soffice_path = find_soffice_executable()
         excel_ok = _is_excel_available()
         lines = []
@@ -2106,30 +2239,31 @@ class ExcelFinderApp(tk.Tk):
                 lines.append("✗ Microsoft Excel: не найден")
             else:
                 lines.append("— Microsoft Excel: доступен только на Windows")
+        try:
+            import reportlab  # noqa: F401
+
+            has_rl = True
+        except ImportError:
+            has_rl = False
+        if has_rl:
+            lines.append("✓ reportlab: установлен")
+        else:
+            lines.append("✗ reportlab: не установлен")
 
         if soffice_path:
-            engine_info = " | ".join(lines) + "  →  будет использован LibreOffice (точная конвертация, приоритет)."
+            auto_hint = "Авто → LibreOffice"
             fg = "#1a7f37"
         elif excel_ok:
-            engine_info = " | ".join(lines) + "  →  будет использован Microsoft Excel (точная конвертация через COM)."
+            auto_hint = "Авто → Excel"
             fg = "#1a7f37"
+        elif has_rl:
+            auto_hint = "Авто → reportlab"
+            fg = "#b7791f"
         else:
-            # проверяем reportlab
-            try:
-                import reportlab  # noqa: F401
-
-                has_rl = True
-            except ImportError:
-                has_rl = False
-            if has_rl:
-                engine_info = " | ".join(lines) + "  →  будет использован reportlab (упрощённая табличная конвертация без сохранения форматирования)."
-                fg = "#b7791f"
-            else:
-                engine_info = " | ".join(lines) + "  →  нет доступных движков. Установите LibreOffice (https://www.libreoffice.org/) или Microsoft Excel, или выполните: pip install reportlab."
-                fg = "#c0392b"
-        ttk.Label(frame_naming, text=engine_info, font=("Segoe UI", 8), foreground=fg, wraplength=780, justify="left").pack(
-            anchor="w", pady=(4, 0)
-        )
+            auto_hint = "Нет доступных движков"
+            fg = "#c0392b"
+        engine_info = " | ".join(lines) + f"  →  {auto_hint}."
+        ttk.Label(frame_engine, text=engine_info, font=("Segoe UI", 8), foreground=fg, wraplength=780, justify="left", anchor="w").pack(anchor="w", pady=(6, 0))
 
         # Кнопка запуска
         self.btn_pdf_run = ttk.Button(
@@ -2142,7 +2276,7 @@ class ExcelFinderApp(tk.Tk):
         self.pdf_progress = ttk.Progressbar(self.tab_pdf, mode="determinate")
         self.pdf_progress.pack(fill="x", padx=10, pady=2)
 
-        frame_log = ttk.LabelFrame(self.tab_pdf, text=" 3. Журнал ", padding=8)
+        frame_log = ttk.LabelFrame(self.tab_pdf, text=" 4. Журнал ", padding=8)
         frame_log.pack(fill="both", expand=True, **pad_opts)
 
         self.txt_pdf_log = tk.Text(frame_log, height=12, wrap="word", font=("Consolas", 9))
@@ -2200,6 +2334,7 @@ class ExcelFinderApp(tk.Tk):
         out = self.ent_pdf_out.get().strip()
         naming = self.var_pdf_naming.get()
         keep = self.var_pdf_keep_structure.get()
+        engine = self.var_pdf_engine.get() if hasattr(self, "var_pdf_engine") else "auto"
 
         if not src or not os.path.isdir(src):
             messagebox.showwarning("Предупреждение", "Укажите корректную исходную папку с XLSX!")
@@ -2222,6 +2357,7 @@ class ExcelFinderApp(tk.Tk):
                 lambda v: self.after(0, lambda: self.pdf_progress.config(value=v)),
                 lambda s, m: self.after(0, lambda: self._on_pdf_finish(s, m)),
                 keep,
+                engine,
             ),
             daemon=True,
         ).start()
