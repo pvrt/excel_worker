@@ -2313,15 +2313,19 @@ class ExcelFinderApp(tk.Tk):
             "При совпадении имён добавится _1, _2. Приоритет движков: LibreOffice -> Microsoft Excel (если LibreOffice не установлен) -> reportlab (упрощённо).",
         )
 
-        frame_paths = ttk.LabelFrame(
-            self.tab_pdf, text=" 1. Папки ", padding=10
-        )
-        frame_paths.pack(fill="x", **pad_opts)
+        # Ряд: 1. Папки | 2. Как называть (в одну строку)
+        top_row = ttk.Frame(self.tab_pdf)
+        top_row.pack(fill="x", padx=10, pady=5)
+        top_row.columnconfigure(0, weight=1)
+        top_row.columnconfigure(1, weight=1)
+
+        frame_paths = ttk.LabelFrame(top_row, text=" 1. Папки ", padding=10)
+        frame_paths.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
 
         # Исходная папка
         f_src = ttk.Frame(frame_paths)
         f_src.pack(fill="x", pady=2)
-        ttk.Label(f_src, text="Папка с XLSX (с подпапками):", width=28).pack(side="left")
+        ttk.Label(f_src, text="Папка с XLSX:", width=14).pack(side="left")
         self.ent_pdf_src = ttk.Entry(f_src)
         self.ent_pdf_src.pack(side="left", fill="x", expand=True, padx=5)
         ttk.Button(f_src, text="Обзор...", command=self._browse_pdf_src).pack(side="left", padx=2)
@@ -2329,16 +2333,14 @@ class ExcelFinderApp(tk.Tk):
         # Выходная папка
         f_out = ttk.Frame(frame_paths)
         f_out.pack(fill="x", pady=4)
-        ttk.Label(f_out, text="Папка для PDF:", width=28).pack(side="left")
+        ttk.Label(f_out, text="Папка для PDF:", width=14).pack(side="left")
         self.ent_pdf_out = ttk.Entry(f_out)
         self.ent_pdf_out.pack(side="left", fill="x", expand=True, padx=5)
         ttk.Button(f_out, text="Обзор...", command=self._browse_pdf_out).pack(side="left", padx=2)
 
         # Опции именования
-        frame_naming = ttk.LabelFrame(
-            self.tab_pdf, text=" 2. Как называть PDF файлы ", padding=10
-        )
-        frame_naming.pack(fill="x", **pad_opts)
+        frame_naming = ttk.LabelFrame(top_row, text=" 2. Как называть PDF файлы ", padding=10)
+        frame_naming.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
 
         self.var_pdf_naming = tk.StringVar(value="filename")
 
