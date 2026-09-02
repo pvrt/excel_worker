@@ -1,8 +1,13 @@
 openpyxl==3.1.5
 et_xmlfile==2.0.0
-# Для конвертации XLSX->PDF: LibreOffice приоритет, затем Excel, затем reportlab
+# Для конвертации XLSX->PDF: LibreOffice приоритет, затем Excel, затем reportlab, затем Google
 reportlab==4.2.0
 # pywin32 нужен только на Windows для работы через Microsoft Excel COM
 pywin32==312; platform_system == "Windows"
+# Google Sheets конвертация (опционально, для движка Google)
+google-api-python-client==2.143.0
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+requests==2.32.3
 # Для сборки
 pyinstaller==6.22.2

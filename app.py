@@ -151,6 +151,111 @@ def _is_excel_available() -> bool:
     return False
 
 
+GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+
+def _get_google_drive_service(credentials_path: str = "credentials.json", token_path: str = "token.json"):
+    """Создаёт сервис Google Drive с OAuth (credentials.json -> token.json)."""
+    try:
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+        from google.auth.transport.requests import Request
+    except ImportError as e:
+        raise RuntimeError(
+            "Не установлены Google библиотеки. Выполните:\n"
+            "pip install google-api-python-client google-auth google-auth-oauthlib requests"
+        ) from e
+
+    creds = None
+    if os.path.exists(token_path):
+        try:
+            creds = Credentials.from_authorized_user_file(token_path, GOOGLE_DRIVE_SCOPES)
+        except Exception:
+            creds = None
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception:
+                creds = None
+        if not creds or not creds.valid:
+            if not os.path.exists(credentials_path):
+                raise FileNotFoundError(
+                    f"Не найден файл {credentials_path}.\n"
+                    "Скачайте его в Google Cloud Console -> APIs & Services -> Credentials -> Create OAuth client ID (Desktop)."
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(credentials_path, GOOGLE_DRIVE_SCOPES)
+            creds = flow.run_local_server(port=0)
+            # Сохраняем токен
+            try:
+                with open(token_path, "w", encoding="utf-8") as f:
+                    f.write(creds.to_json())
+            except Exception:
+                pass
+    try:
+        service = build("drive", "v3", credentials=creds)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось создать Google Drive сервис: {e}") from e
+    return service, creds
+
+
+def _convert_single_xlsx_to_pdf_google(drive_service, creds, xlsx_path: Path, pdf_path: Path) -> None:
+    """Конвертирует один xlsx в pdf через Google Drive/Sheets (загрузка -> экспорт -> удаление)."""
+    try:
+        from googleapiclient.http import MediaFileUpload
+        import requests
+    except ImportError as e:
+        raise RuntimeError("Не установлены зависимости Google. pip install google-api-python-client requests") from e
+
+    # Обновляем токен если истёк
+    try:
+        if creds.expired and creds.refresh_token:
+            from google.auth.transport.requests import Request
+
+            creds.refresh(Request())
+    except Exception:
+        pass
+
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    file_metadata = {
+        "name": xlsx_path.stem,
+        "mimeType": "application/vnd.google-apps.spreadsheet",
+    }
+    media = MediaFileUpload(
+        str(xlsx_path),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        resumable=True,
+    )
+    uploaded = drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+    file_id = uploaded.get("id")
+    if not file_id:
+        raise RuntimeError("Google Drive не вернул fileId")
+    try:
+        # Параметры экспорта как в примере: A4, альбом, fitw, сетка, повтор шапки
+        export_url = (
+            f"https://docs.google.com/spreadsheets/d/{file_id}/export?"
+            f"exportFormat=pdf&format=pdf"
+            f"&size=A4"
+            f"&portrait=false"
+            f"&fitw=true"
+            f"&gridlines=true"
+            f"&fzr=true"
+        )
+        headers = {"Authorization": f"Bearer {creds.token}"}
+        resp = requests.get(export_url, headers=headers, timeout=120)
+        resp.raise_for_status()
+        with open(pdf_path, "wb") as f:
+            f.write(resp.content)
+        if pdf_path.stat().st_size == 0:
+            raise RuntimeError("Google вернул пустой PDF")
+    finally:
+        try:
+            drive_service.files().delete(fileId=file_id).execute()
+        except Exception:
+            pass
+
+
 def _convert_single_xlsx_to_pdf_excel(excel_app, xlsx_path: Path, pdf_path: Path) -> None:
     """Конвертирует один xlsx в pdf через уже запущенный Excel COM-объект. Стараемся убрать лишние пустые страницы."""
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
@@ -805,6 +910,8 @@ def process_xlsx_to_pdf(
     finish_callback,
     keep_structure: bool = False,
     engine: str = "auto",
+    google_credentials: str = "credentials.json",
+    google_token: str = "token.json",
 ):
     """Фоновая конвертация папки с xlsx в pdf с выбором схемы именования.
 
@@ -815,10 +922,11 @@ def process_xlsx_to_pdf(
         True — сохранять структуру подпапок (out/подпапка/файл.pdf)
         False — складывать все PDF плоско в одну папку
     engine:
-        'auto' — LibreOffice → Excel → reportlab (приоритет)
+        'auto' — LibreOffice -> Excel -> reportlab (приоритет)
         'libre' — только LibreOffice
         'excel' — только Microsoft Excel (COM)
         'reportlab' — только reportlab (упрощённо)
+        'google' — Google Sheets (Drive API, требует credentials.json)
     """
     try:
         src = Path(source_dir)
@@ -845,7 +953,10 @@ def process_xlsx_to_pdf(
         soffice = find_soffice_executable()
         use_libre = False
         use_excel = False
+        use_google = False
         excel_app = None
+        drive_service = None
+        google_creds = None
         engine = (engine or "auto").lower()
         log_callback(f"Выбран движок: {engine}")
 
@@ -891,6 +1002,14 @@ def process_xlsx_to_pdf(
                 log_callback("Используется reportlab (упрощённая табличная конвертация)")
             except ImportError:
                 finish_callback(False, "Не установлен reportlab.\nВыполните: pip install reportlab")
+                return
+        elif engine == "google":
+            try:
+                drive_service, google_creds = _get_google_drive_service(google_credentials, google_token)
+                use_google = True
+                log_callback("Используется Google Sheets (Drive API) — конвертация через Google (A4, альбом, fitw)")
+            except Exception as e:
+                finish_callback(False, f"Ошибка Google Drive: {e}\nПроверьте credentials.json и доступ к интернету.")
                 return
         else:  # auto
             if soffice:
@@ -1028,6 +1147,13 @@ def process_xlsx_to_pdf(
                     except ValueError:
                         rel_out = target_pdf.name
                     log_callback(f"[{idx}/{total}] OK (Excel): {fpath.name} -> {rel_out}")
+                elif use_google:
+                    _convert_single_xlsx_to_pdf_google(drive_service, google_creds, fpath, target_pdf)
+                    try:
+                        rel_out = str(target_pdf.relative_to(out))
+                    except ValueError:
+                        rel_out = target_pdf.name
+                    log_callback(f"[{idx}/{total}] OK (Google): {fpath.name} -> {rel_out}")
                 else:
                     _convert_single_xlsx_to_pdf_reportlab(fpath, target_pdf)
                     try:
@@ -1064,6 +1190,8 @@ def process_xlsx_to_pdf(
             msg += "\nДвижок: LibreOffice"
         elif use_excel:
             msg += "\nДвижок: Microsoft Excel"
+        elif use_google:
+            msg += "\nДвижок: Google Sheets"
         else:
             msg += "\nДвижок: reportlab (упрощённо)"
         finish_callback(True, msg)
@@ -2145,7 +2273,7 @@ class ExcelFinderApp(tk.Tk):
             "Выберите, как называть PDF: 1) по имени исходного Excel-файла (report.xlsx -> report.pdf) или 2) по имени папки, где лежит файл "
             "(папка_123/report.xlsx -> папка_123.pdf — удобно, когда в каждой подпапке один файл). "
             "Галочка «Сохранять структуру папок» — создаст в выходной папке такие же подпапки, как в исходной; без неё все PDF лягут в одну папку. "
-            "При совпадении имён добавится _1, _2. Приоритет движков: LibreOffice → Microsoft Excel (если LibreOffice не установлен) → reportlab (упрощённо).",
+            "При совпадении имён добавится _1, _2. Приоритет движков: LibreOffice -> Microsoft Excel (если LibreOffice не установлен) -> reportlab (упрощённо).",
         )
 
         frame_paths = ttk.LabelFrame(
@@ -2219,10 +2347,11 @@ class ExcelFinderApp(tk.Tk):
         frame_engine.pack(fill="x", **pad_opts)
 
         self.var_pdf_engine = tk.StringVar(value="auto")
-        ttk.Radiobutton(frame_engine, text="Авто (рекомендуется) — LibreOffice → Excel → reportlab", value="auto", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
+        ttk.Radiobutton(frame_engine, text="Авто (рекомендуется) — LibreOffice -> Excel -> reportlab", value="auto", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
         ttk.Radiobutton(frame_engine, text="Только LibreOffice (точная, сохраняет форматирование)", value="libre", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
         ttk.Radiobutton(frame_engine, text="Только Microsoft Excel (точная, через COM — нужен Excel)", value="excel", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
         ttk.Radiobutton(frame_engine, text="Только reportlab (упрощённая таблица, без Excel/LibreOffice)", value="reportlab", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
+        ttk.Radiobutton(frame_engine, text="Только Google Sheets (через Drive API — нужен credentials.json)", value="google", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
 
         # Инфо о доступных движках
         soffice_path = find_soffice_executable()
@@ -2249,21 +2378,77 @@ class ExcelFinderApp(tk.Tk):
             lines.append("✓ reportlab: установлен")
         else:
             lines.append("✗ reportlab: не установлен")
+        # Google — проверяем наличие библиотек и credentials
+        try:
+            import googleapiclient  # noqa: F401
+
+            has_google_lib = True
+        except ImportError:
+            has_google_lib = False
+        cred_default = str(Path(__file__).parent / "credentials.json")
+        has_cred = os.path.isfile(cred_default)
+        if has_google_lib and has_cred:
+            lines.append("✓ Google: готов (библиотеки + credentials.json)")
+        elif has_google_lib:
+            lines.append("○ Google: библиотеки есть, нет credentials.json")
+        else:
+            lines.append("✗ Google: нет библиотек (pip install google-api-python-client)")
 
         if soffice_path:
-            auto_hint = "Авто → LibreOffice"
+            auto_hint = "Авто -> LibreOffice"
             fg = "#1a7f37"
         elif excel_ok:
-            auto_hint = "Авто → Excel"
+            auto_hint = "Авто -> Excel"
             fg = "#1a7f37"
         elif has_rl:
-            auto_hint = "Авто → reportlab"
+            auto_hint = "Авто -> reportlab"
             fg = "#b7791f"
         else:
             auto_hint = "Нет доступных движков"
             fg = "#c0392b"
-        engine_info = " | ".join(lines) + f"  →  {auto_hint}."
+        engine_info = " | ".join(lines) + f"  ->  {auto_hint}."
         ttk.Label(frame_engine, text=engine_info, font=("Segoe UI", 8), foreground=fg, wraplength=780, justify="left", anchor="w").pack(anchor="w", pady=(6, 0))
+
+        # Настройки Google (видны только при выборе Google)
+        self.frame_google = ttk.LabelFrame(self.tab_pdf, text=" Настройки Google Sheets ", padding=10)
+        # не pack сразу, покажем по выбору движка
+
+        f_cred = ttk.Frame(self.frame_google)
+        f_cred.pack(fill="x", pady=2)
+        ttk.Label(f_cred, text="credentials.json:", width=18).pack(side="left")
+        self.ent_google_creds = ttk.Entry(f_cred)
+        self.ent_google_creds.pack(side="left", fill="x", expand=True, padx=5)
+        # по умолчанию credentials.json рядом с app.py
+        default_cred = str(Path(__file__).parent / "credentials.json")
+        self.ent_google_creds.insert(0, default_cred)
+        ttk.Button(f_cred, text="Обзор...", command=self._browse_google_creds).pack(side="left", padx=2)
+
+        f_tok = ttk.Frame(self.frame_google)
+        f_tok.pack(fill="x", pady=2)
+        ttk.Label(f_tok, text="token.json:", width=18).pack(side="left")
+        self.ent_google_token = ttk.Entry(f_tok)
+        self.ent_google_token.pack(side="left", fill="x", expand=True, padx=5)
+        default_tok = str(Path(__file__).parent / "token.json")
+        self.ent_google_token.insert(0, default_tok)
+        ttk.Button(f_tok, text="Обзор...", command=self._browse_google_token).pack(side="left", padx=2)
+
+        ttk.Label(
+            self.frame_google,
+            text="1. Создайте проект в Google Cloud Console -> Drive API -> Credentials -> OAuth client ID (Desktop).\n"
+            "2. Скачайте credentials.json и укажите путь. При первой конвертации откроется браузер для входа.",
+            font=("Segoe UI", 8),
+            foreground="#666",
+            justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+        ttk.Button(self.frame_google, text="🔑 Проверить подключение Google", command=self._test_google_connection).pack(anchor="w", pady=(6, 0))
+
+        # Обновляем видимость Google-фрейма при переключении движка
+        for rb in frame_engine.winfo_children():
+            try:
+                rb.configure(command=self._on_pdf_engine_changed)
+            except Exception:
+                pass
+        self._on_pdf_engine_changed()
 
         # Кнопка запуска
         self.btn_pdf_run = ttk.Button(
@@ -2296,6 +2481,55 @@ class ExcelFinderApp(tk.Tk):
             text="Очистить журнал",
             command=lambda: self.txt_pdf_log.delete(1.0, tk.END),
         ).pack(side="right", padx=3)
+
+    def _on_pdf_engine_changed(self):
+        """Показывает/скрывает настройки Google в зависимости от выбранного движка."""
+        if not hasattr(self, "frame_google") or not hasattr(self, "var_pdf_engine"):
+            return
+        eng = self.var_pdf_engine.get()
+        if eng == "google":
+            # Показать перед кнопкой запуска
+            try:
+                self.frame_google.pack(fill="x", padx=10, pady=5, before=self.btn_pdf_run)
+            except Exception:
+                self.frame_google.pack(fill="x", padx=10, pady=5)
+        else:
+            self.frame_google.pack_forget()
+
+    def _browse_google_creds(self):
+        path = filedialog.askopenfilename(title="Выберите credentials.json", filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        if path:
+            self.ent_google_creds.delete(0, tk.END)
+            self.ent_google_creds.insert(0, path)
+            # по умолчанию token рядом с credentials
+            tok = str(Path(path).parent / "token.json")
+            self.ent_google_token.delete(0, tk.END)
+            self.ent_google_token.insert(0, tok)
+
+    def _browse_google_token(self):
+        path = filedialog.askopenfilename(title="Выберите token.json", filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        if path:
+            self.ent_google_token.delete(0, tk.END)
+            self.ent_google_token.insert(0, path)
+
+    def _test_google_connection(self):
+        cred = self.ent_google_creds.get().strip() if hasattr(self, "ent_google_creds") else "credentials.json"
+        tok = self.ent_google_token.get().strip() if hasattr(self, "ent_google_token") else "token.json"
+        if not cred or not os.path.isfile(cred):
+            messagebox.showwarning("Проверка Google", f"Не найден файл credentials.json:\n{cred}")
+            return
+        try:
+            self.txt_pdf_log.insert(tk.END, f"Проверка Google Drive... {cred}\n")
+            self.txt_pdf_log.see(tk.END)
+            service, creds = _get_google_drive_service(cred, tok)
+            # пробный запрос — список файлов (1)
+            service.files().list(pageSize=1, fields="files(id,name)").execute()
+            messagebox.showinfo("Проверка Google", "Подключение успешно! Токен сохранён.")
+            self.txt_pdf_log.insert(tk.END, "Google Drive: подключение успешно\n")
+        except Exception as e:
+            messagebox.showerror("Проверка Google", f"Ошибка подключения:\n{e}")
+            self.txt_pdf_log.insert(tk.END, f"Google ошибка: {e}\n")
+        self.txt_pdf_log.see(tk.END)
 
     def _browse_pdf_src(self):
         path = filedialog.askdirectory(title="Выберите папку с XLSX файлами")
@@ -2335,6 +2569,8 @@ class ExcelFinderApp(tk.Tk):
         naming = self.var_pdf_naming.get()
         keep = self.var_pdf_keep_structure.get()
         engine = self.var_pdf_engine.get() if hasattr(self, "var_pdf_engine") else "auto"
+        gcreds = self.ent_google_creds.get().strip() if hasattr(self, "ent_google_creds") else str(Path(__file__).parent / "credentials.json")
+        gtok = self.ent_google_token.get().strip() if hasattr(self, "ent_google_token") else str(Path(__file__).parent / "token.json")
 
         if not src or not os.path.isdir(src):
             messagebox.showwarning("Предупреждение", "Укажите корректную исходную папку с XLSX!")
@@ -2358,6 +2594,8 @@ class ExcelFinderApp(tk.Tk):
                 lambda s, m: self.after(0, lambda: self._on_pdf_finish(s, m)),
                 keep,
                 engine,
+                gcreds,
+                gtok,
             ),
             daemon=True,
         ).start()
