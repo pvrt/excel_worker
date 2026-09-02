@@ -6,10 +6,18 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import openpyxl
+
+
+def _get_app_dir() -> Path:
+    """Папка рядом с exe (для PyInstaller) или рядом с app.py."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
 
 
 # ==============================================================================
@@ -218,6 +226,27 @@ def _get_google_drive_service(credentials_path: str = "credentials.json", token_
             "pip install google-api-python-client google-auth google-auth-oauthlib requests"
         ) from e
 
+    # --- Service Account (для раздачи другим) ---
+    try:
+        import json
+
+        if os.path.exists(credentials_path):
+            with open(credentials_path, "r", encoding="utf-8") as f:
+                _data = json.load(f)
+            if _data.get("type") == "service_account":
+                from google.oauth2.service_account import Credentials as SACredentials
+
+                creds = SACredentials.from_service_account_file(credentials_path, scopes=GOOGLE_DRIVE_SCOPES)
+                # Обновляем токен для service account
+                try:
+                    creds.refresh(Request())
+                except Exception:
+                    pass
+                service = build("drive", "v3", credentials=creds)
+                return service, creds
+    except Exception:
+        pass
+
     creds = None
     if os.path.exists(token_path):
         try:
@@ -234,7 +263,8 @@ def _get_google_drive_service(credentials_path: str = "credentials.json", token_
             if not os.path.exists(credentials_path):
                 raise FileNotFoundError(
                     f"Не найден файл {credentials_path}.\n"
-                    "Скачайте его в Google Cloud Console -> APIs & Services -> Credentials -> Create OAuth client ID (Desktop)."
+                    "Для OAuth: Google Cloud Console -> APIs & Services -> Credentials -> Create OAuth client ID (Desktop).\n"
+                    "Для Service Account (раздача): IAM -> Service Accounts -> Create -> Key JSON."
                 )
             flow = InstalledAppFlow.from_client_secrets_file(credentials_path, GOOGLE_DRIVE_SCOPES)
             creds = flow.run_local_server(port=0)
@@ -266,12 +296,17 @@ def _convert_single_xlsx_to_pdf_google(drive_service, creds, xlsx_path: Path, pd
     except ImportError as e:
         raise RuntimeError("Не установлены зависимости Google. pip install google-api-python-client requests") from e
 
-    # Обновляем токен если истёк
+    # Обновляем токен если истёк (для OAuth и Service Account)
     try:
-        if creds.expired and creds.refresh_token:
+        if getattr(creds, "expired", False):
             from google.auth.transport.requests import Request
 
-            creds.refresh(Request())
+            # Для service account refresh_token == None, но refresh всё равно нужен
+            try:
+                creds.refresh(Request())
+            except Exception:
+                # Для OAuth без refresh_token — оставляем как есть, будет ошибка позже
+                pass
     except Exception:
         pass
 
@@ -2621,9 +2656,20 @@ class ExcelFinderApp(tk.Tk):
             has_google_lib = True
         except ImportError:
             has_google_lib = False
-        cred_default = str(Path(__file__).parent / "credentials.json")
+        cred_default = str(_get_app_dir() / "credentials.json")
         has_cred = os.path.isfile(cred_default)
-        if has_google_lib and has_cred:
+        is_sa = False
+        if has_cred:
+            try:
+                import json
+
+                with open(cred_default, "r", encoding="utf-8") as _f:
+                    is_sa = json.load(_f).get("type") == "service_account"
+            except Exception:
+                is_sa = False
+        if has_google_lib and has_cred and is_sa:
+            lines.append("✓ Google: Service Account готов")
+        elif has_google_lib and has_cred:
             lines.append("✓ Google: готов (библиотеки + credentials.json)")
         elif has_google_lib:
             lines.append("○ Google: библиотеки есть, нет credentials.json")
@@ -2654,8 +2700,8 @@ class ExcelFinderApp(tk.Tk):
         ttk.Label(f_cred, text="credentials.json:", width=18).pack(side="left")
         self.ent_google_creds = ttk.Entry(f_cred)
         self.ent_google_creds.pack(side="left", fill="x", expand=True, padx=5)
-        # по умолчанию credentials.json рядом с app.py
-        default_cred = str(Path(__file__).parent / "credentials.json")
+        # по умолчанию credentials.json рядом с exe/app.py
+        default_cred = str(_get_app_dir() / "credentials.json")
         self.ent_google_creds.insert(0, default_cred)
         ttk.Button(f_cred, text="Обзор...", command=self._browse_google_creds).pack(side="left", padx=2)
 
@@ -2664,17 +2710,22 @@ class ExcelFinderApp(tk.Tk):
         ttk.Label(f_tok, text="token.json:", width=18).pack(side="left")
         self.ent_google_token = ttk.Entry(f_tok)
         self.ent_google_token.pack(side="left", fill="x", expand=True, padx=5)
-        default_tok = str(Path(__file__).parent / "token.json")
+        default_tok = str(_get_app_dir() / "token.json")
         self.ent_google_token.insert(0, default_tok)
         ttk.Button(f_tok, text="Обзор...", command=self._browse_google_token).pack(side="left", padx=2)
 
         ttk.Label(
             self.frame_google,
-            text="1. Создайте проект в Google Cloud Console -> Drive API -> Credentials -> OAuth client ID (Desktop).\n"
-            "2. Скачайте credentials.json и укажите путь. При первой конвертации откроется браузер для входа.",
+            text=(
+                "OAuth (для себя): Cloud Console → APIs & Services → Library → Drive API → Enable → "
+                "Credentials → OAuth consent (External) → Create OAuth client ID (Desktop) → скачайте credentials.json.\n"
+                "Service Account (для раздачи другим, рекомендуется): IAM & Admin → Service Accounts → Create service account → "
+                "Create Key (JSON) → скачайте как credentials.json → расшарьте папку Google Drive на email сервис-аккаунта (Editor)."
+            ),
             font=("Segoe UI", 8),
             foreground="#666",
             justify="left",
+            wraplength=760,
         ).pack(anchor="w", pady=(6, 0))
         ttk.Button(self.frame_google, text="🔑 Проверить подключение Google", command=self._test_google_connection).pack(anchor="w", pady=(6, 0))
 
@@ -3021,8 +3072,8 @@ class ExcelFinderApp(tk.Tk):
         naming = self.var_pdf_naming.get()
         keep = self.var_pdf_keep_structure.get()
         engine = self.var_pdf_engine.get() if hasattr(self, "var_pdf_engine") else "auto"
-        gcreds = self.ent_google_creds.get().strip() if hasattr(self, "ent_google_creds") else str(Path(__file__).parent / "credentials.json")
-        gtok = self.ent_google_token.get().strip() if hasattr(self, "ent_google_token") else str(Path(__file__).parent / "token.json")
+        gcreds = self.ent_google_creds.get().strip() if hasattr(self, "ent_google_creds") else str(_get_app_dir() / "credentials.json")
+        gtok = self.ent_google_token.get().strip() if hasattr(self, "ent_google_token") else str(_get_app_dir() / "token.json")
 
         if not src or not os.path.isdir(src):
             messagebox.showwarning("Предупреждение", "Укажите корректную исходную папку с XLSX!")
