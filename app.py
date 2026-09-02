@@ -21,7 +21,7 @@ def _get_app_dir() -> Path:
 
 
 def _resolve_google_path(path: str) -> str:
-    """Находит credentials/token рядом с exe, в bundle (_MEIPASS) или по переданному пути."""
+    """Находит credentials/token рядом с exe, в bundle (_MEIPASS), рядом с исходником или по переданному пути."""
     if not path:
         return path
     p = Path(path)
@@ -31,6 +31,20 @@ def _resolve_google_path(path: str) -> str:
     app_p = _get_app_dir() / p.name
     if app_p.is_file():
         return str(app_p)
+    # пробуем в родительской папке exe (когда exe в dist/, а файл в проекте D:/dev/excel_worker)
+    try:
+        parent_p = _get_app_dir().parent / p.name
+        if parent_p.is_file():
+            return str(parent_p)
+    except Exception:
+        pass
+    # пробуем рядом с исходником app.py (для python app.py)
+    try:
+        src_p = Path(__file__).parent / p.name
+        if src_p.is_file():
+            return str(src_p)
+    except Exception:
+        pass
     # пробуем в PyInstaller bundle
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         bundle_p = Path(sys._MEIPASS) / p.name  # type: ignore[attr-defined]
@@ -2742,17 +2756,27 @@ class ExcelFinderApp(tk.Tk):
         ttk.Label(self.frame_google_cred, text="credentials.json:", width=18).pack(side="left")
         self.ent_google_creds = ttk.Entry(self.frame_google_cred)
         self.ent_google_creds.pack(side="left", fill="x", expand=True, padx=5)
-        # по умолчанию credentials.json рядом с exe/app.py
-        default_cred = str(_get_app_dir() / "credentials.json")
+        # по умолчанию ищем файл рядом с exe, в bundle, рядом с исходником
+        _cand_cred = _resolve_google_path(str(_get_app_dir() / "credentials.json"))
+        if not os.path.isfile(_cand_cred):
+            _cand_cred = _resolve_google_path("credentials.json")
+            if not os.path.isfile(_cand_cred):
+                _cand_cred = str(_get_app_dir() / "credentials.json")
+        default_cred = _cand_cred
         self.ent_google_creds.insert(0, default_cred)
-        ttk.Button(self.frame_google_cred, text="Обзор...", command=self._browse_google_creds).pack(side="left", padx=2)
+        ttk.Button(f_cred, text="Обзор...", command=self._browse_google_creds).pack(side="left", padx=2)
 
-        self.frame_google_token = ttk.Frame(self.frame_google)
-        self.frame_google_token.pack(fill="x", pady=2)
-        ttk.Label(self.frame_google_token, text="token.json:", width=18).pack(side="left")
-        self.ent_google_token = ttk.Entry(self.frame_google_token)
+        f_tok = ttk.Frame(self.frame_google)
+        f_tok.pack(fill="x", pady=2)
+        ttk.Label(f_tok, text="token.json:", width=18).pack(side="left")
+        self.ent_google_token = ttk.Entry(f_tok)
         self.ent_google_token.pack(side="left", fill="x", expand=True, padx=5)
-        default_tok = str(_get_app_dir() / "token.json")
+        _cand_tok = _resolve_google_path(str(_get_app_dir() / "token.json"))
+        if not os.path.isfile(_cand_tok):
+            _cand_tok = _resolve_google_path("token.json")
+            if not os.path.isfile(_cand_tok):
+                _cand_tok = str(_get_app_dir() / "token.json")
+        default_tok = _cand_tok
         self.ent_google_token.insert(0, default_tok)
         ttk.Button(self.frame_google_token, text="Обзор...", command=self._browse_google_token).pack(side="left", padx=2)
 
