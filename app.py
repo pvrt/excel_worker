@@ -152,14 +152,40 @@ def _is_excel_available() -> bool:
 
 
 def _convert_single_xlsx_to_pdf_excel(excel_app, xlsx_path: Path, pdf_path: Path) -> None:
-    """Конвертирует один xlsx в pdf через уже запущенный Excel COM-объект."""
+    """Конвертирует один xlsx в pdf через уже запущенный Excel COM-объект. Стараемся убрать лишние пустые страницы."""
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
-    # Excel требует абсолютные пути
     abs_src = str(xlsx_path.resolve())
     abs_dst = str(pdf_path.resolve())
     wb = excel_app.Workbooks.Open(abs_src)
     try:
-        # 0 = xlTypePDF, Quality 0 = standard
+        # Пытаемся ограничить печать только используемым диапазоном и подогнать по ширине
+        try:
+            ws = wb.ActiveSheet
+            used = ws.UsedRange
+            # Если UsedRange не пустой — задаём область печати
+            if used is not None:
+                try:
+                    ws.PageSetup.PrintArea = used.Address
+                except Exception:
+                    pass
+                try:
+                    ws.PageSetup.Zoom = False
+                    ws.PageSetup.FitToPagesWide = 1
+                    ws.PageSetup.FitToPagesTall = 0  # в высоту — сколько нужно, без пустых страниц
+                    ws.PageSetup.Orientation = 2 if used.Columns.Count > 6 else 1  # 2=landscape
+                except Exception:
+                    pass
+                try:
+                    # Убираем лишние поля
+                    ws.PageSetup.LeftMargin = excel_app.InchesToPoints(0.25)
+                    ws.PageSetup.RightMargin = excel_app.InchesToPoints(0.25)
+                    ws.PageSetup.TopMargin = excel_app.InchesToPoints(0.3)
+                    ws.PageSetup.BottomMargin = excel_app.InchesToPoints(0.3)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # 0 = xlTypePDF
         wb.ExportAsFixedFormat(0, abs_dst)
     finally:
         try:
@@ -182,12 +208,23 @@ def _convert_single_xlsx_to_pdf_libreoffice(
     tmpdir = Path(tempfile.mkdtemp(prefix="xlsx2pdf_"))
     try:
         expected = tmpdir / f"{xlsx_path.stem}.pdf"
+        # Используем calc_pdf_Export с IsSkipEmptyPages, чтобы не плодить пустые страницы/листы
+        # Для .xls/.xlsx это Calc; для других типов LibreOffice сам выберет фильтр, но указание calc безопасно
+        convert_filter = "pdf:calc_pdf_Export:IsSkipEmptyPages=true;SelectPdfVersion=1"
         result = subprocess.run(
-            [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(tmpdir), str(xlsx_path)],
+            [soffice, "--headless", "--convert-to", convert_filter, "--outdir", str(tmpdir), str(xlsx_path)],
             capture_output=True,
             text=True,
             timeout=timeout,
         )
+        # Fallback без опций, если фильтр не поддерживается старой версией
+        if result.returncode != 0 and "Error" in (result.stderr or ""):
+            result = subprocess.run(
+                [soffice, "--headless", "--convert-to", "pdf", "--outdir", str(tmpdir), str(xlsx_path)],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"soffice exit {result.returncode}")
         if not expected.exists():
@@ -255,20 +292,10 @@ def _convert_single_xlsx_to_pdf_reportlab(xlsx_path: Path, pdf_path: Path) -> No
             if len(v) > 120:
                 rows[i][j] = v[:117] + "..."
 
-    # Создаём PDF
+    # Создаём PDF — сначала готовим стили и таблицу, затем подбираем высоту страницы
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
-    # Используем альбомную ориентацию если много колонок
-    pagesize = landscape(A4) if max_cols > 5 else A4
-
-    doc = SimpleDocTemplate(
-        str(pdf_path),
-        pagesize=pagesize,
-        leftMargin=10 * mm,
-        rightMargin=10 * mm,
-        topMargin=10 * mm,
-        bottomMargin=10 * mm,
-        title=xlsx_path.stem,
-    )
+    # Базовый формат — A4 или альбом, если много колонок
+    base_pagesize = landscape(A4) if max_cols > 5 else A4
 
     # Стиль таблицы
     style = TableStyle(
@@ -302,19 +329,50 @@ def _convert_single_xlsx_to_pdf_reportlab(xlsx_path: Path, pdf_path: Path) -> No
 
     table_data = [[_cell(v) for v in r] for r in rows]
 
-    # Ширина колонок — равномерно
-    avail_w = pagesize[0] - 20 * mm
+    # Ширина колонок — равномерно (учитываем поля 10мм слева/справа)
+    avail_w = base_pagesize[0] - 20 * mm
     col_w = avail_w / max_cols if max_cols else avail_w
     col_widths = [col_w] * max_cols
 
     table = Table(table_data, colWidths=col_widths, repeatRows=1)
     table.setStyle(style)
 
+    # Оцениваем высоту таблицы, чтобы убрать лишнее пустое место внизу
+    # wrap с большой высотой даёт реальную высоту контента
+    try:
+        _tw, th = table.wrap(avail_w, 9999 * mm)
+    except Exception:
+        th = len(rows) * 14  # fallback ~14pt на строку
+    title_h = 22  # заголовок + отступ
+    needed_h = th + title_h + 20 * mm  # верх+низ поля
+    # Минимальная и максимальная высоты
+    min_h = 90 * mm
+    max_h = base_pagesize[1]
+    if needed_h < min_h:
+        needed_h = min_h
+    # Если таблица маленькая (<=15 строк) и заметно меньше A4 — делаем страницу короче,
+    # чтобы не было 2-3x пустого места внизу. Для больших таблиц оставляем A4, чтобы не плодить мелкие страницы.
+    if len(rows) <= 15 and needed_h < max_h - 20 * mm:
+        pagesize = (base_pagesize[0], needed_h)
+    else:
+        pagesize = base_pagesize
+
+    doc = SimpleDocTemplate(
+        str(pdf_path),
+        pagesize=pagesize,
+        leftMargin=10 * mm,
+        rightMargin=10 * mm,
+        topMargin=8 * mm,
+        bottomMargin=8 * mm,
+        title=xlsx_path.stem,
+    )
+
     story = []
     title_style = style_sheet["Title"]
-    title_style.fontSize = 12
+    title_style.fontSize = 11
+    title_style.leading = 14
     story.append(Paragraph(xlsx_path.name, title_style))
-    story.append(Spacer(1, 6))
+    story.append(Spacer(1, 4))
     story.append(table)
     doc.build(story)
 
