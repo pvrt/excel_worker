@@ -2731,11 +2731,11 @@ class ExcelFinderApp(tk.Tk):
         frame_engine.pack(fill="x", **pad_opts)
 
         self.var_pdf_engine = tk.StringVar(value="auto")
-        ttk.Radiobutton(frame_engine, text="Авто (рекомендуется) — LibreOffice -> Excel -> reportlab", value="auto", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
-        ttk.Radiobutton(frame_engine, text="Только LibreOffice (точная, сохраняет форматирование)", value="libre", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
-        ttk.Radiobutton(frame_engine, text="Только Microsoft Excel (точная, через COM — нужен Excel)", value="excel", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
-        ttk.Radiobutton(frame_engine, text="Только reportlab (упрощённая таблица, без Excel/LibreOffice)", value="reportlab", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
-        ttk.Radiobutton(frame_engine, text="Только Google Sheets (ключ уже вшит в программу)", value="google", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
+        ttk.Radiobutton(frame_engine, text="Google Sheets", value="google", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
+        ttk.Radiobutton(frame_engine, text="LibreOffice (точная, сохраняет форматирование, нужен установленный LibreOffice)", value="libre", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
+        ttk.Radiobutton(frame_engine, text="Microsoft Excel (точная, нужен установленный Microsoft Excel)", value="excel", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
+        ttk.Radiobutton(frame_engine, text="Reportlab (упрощённая таблица)", value="reportlab", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
+        
 
         # Инфо о доступных движках
         soffice_path = find_soffice_executable()
