@@ -57,6 +57,52 @@ def _get_embedded_sa_info():
     return None
 
 
+def _get_embedded_oauth_info():
+    """Возвращает dict OAuth-токена, вшитый на этапе сборки, или None.
+
+    Токен получается ОДИН РАЗ на dev-машине через браузер (tools/google_oauth_login.py),
+    дальше вшивается в exe и браузер/файлы конечным пользователям не нужны.
+    Источники (по приоритету):
+    1. Модуль google_oauth_embedded.py (генерируется CI из секрета GOOGLE_OAUTH_TOKEN,
+       локально — из token.json; попадает в exe автоматически как .py-модуль).
+    2. Переменная окружения GOOGLE_OAUTH_TOKEN (raw JSON или base64).
+    """
+    # 1. сгенерированный модуль рядом с app.py (в exe — внутри bundle)
+    try:
+        from google_oauth_embedded import GOOGLE_OAUTH_JSON as _emb  # type: ignore
+
+        if isinstance(_emb, dict) and _emb.get("refresh_token"):
+            return _emb
+        if isinstance(_emb, str) and _emb.strip():
+            import json as _json
+
+            _d = _json.loads(_emb)
+            if isinstance(_d, dict) and _d.get("refresh_token"):
+                return _d
+    except Exception:
+        pass
+    # 2. env (удобно для CI/отладки без файлов)
+    try:
+        import json as _json
+        import base64 as _b64
+
+        raw = os.environ.get("GOOGLE_OAUTH_TOKEN", "").strip()
+        if raw:
+            _d = None
+            if raw.startswith("{"):
+                _d = _json.loads(raw)
+            else:
+                try:
+                    _d = _json.loads(_b64.b64decode(raw).decode("utf-8"))
+                except Exception:
+                    _d = None
+            if isinstance(_d, dict) and _d.get("refresh_token"):
+                return _d
+    except Exception:
+        pass
+    return None
+
+
 # ==============================================================================
 #                             ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==============================================================================
@@ -244,7 +290,10 @@ GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
 def _get_google_drive_service():
-    """Сервис Google Drive только по вшитому Service Account. Никаких файлов, браузера и настроек."""
+    """Сервис Google Drive по вшитым данным. Никаких файлов, браузера и настроек у конечных.
+
+    Приоритет: 1. вшитый OAuth-токен (обычный Drive пользователя) → 2. вшитый Service Account.
+    """
     # Для корпоративных прокси с самоподписанным сертификатом — отключаем проверку SSL
     try:
         import ssl
@@ -260,21 +309,38 @@ def _get_google_drive_service():
             "pip install google-api-python-client google-auth google-auth-oauthlib requests"
         ) from e
 
-    _emb = _get_embedded_sa_info()
-    if not _emb:
-        raise RuntimeError(
-            "Ключ Google Service Account не вшит в программу.\n"
-            "Соберите exe через CI (секрет GOOGLE_SERVICE_ACCOUNT_JSON) или локально:\n"
-            "python tools/gen_embedded_sa.py"
-        )
-    try:
-        from google.oauth2.service_account import Credentials as SACredentials
+    # 1. OAuth-токен (обновляется по refresh_token без браузера)
+    _oauth = _get_embedded_oauth_info()
+    if _oauth:
+        try:
+            from google.oauth2.credentials import Credentials as OAuthCredentials
+            from google.auth.transport.requests import Request
 
-        creds = SACredentials.from_service_account_info(_emb, scopes=GOOGLE_DRIVE_SCOPES)
-        service = build("drive", "v3", credentials=creds)
-        return service, creds
-    except Exception as e:
-        raise RuntimeError(f"Google Service Account (вшитый) отклонён: {e}") from e
+            creds = OAuthCredentials.from_authorized_user_info(_oauth, scopes=GOOGLE_DRIVE_SCOPES)
+            if getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
+                creds.refresh(Request())
+            service = build("drive", "v3", credentials=creds)
+            return service, creds
+        except Exception as e:
+            raise RuntimeError(f"Google OAuth (вшитый токен) отклонён: {e}") from e
+
+    # 2. Service Account (для Shared Drives / Workspace; на обычном Drive квоты нет)
+    _emb = _get_embedded_sa_info()
+    if _emb:
+        try:
+            from google.oauth2.service_account import Credentials as SACredentials
+
+            creds = SACredentials.from_service_account_info(_emb, scopes=GOOGLE_DRIVE_SCOPES)
+            service = build("drive", "v3", credentials=creds)
+            return service, creds
+        except Exception as e:
+            raise RuntimeError(f"Google Service Account (вшитый) отклонён: {e}") from e
+
+    raise RuntimeError(
+        "Данные Google не вшиты в программу.\n"
+        "Соберите exe через CI (секрет GOOGLE_OAUTH_TOKEN) или локально:\n"
+        "python tools/google_oauth_login.py && python tools/gen_embedded_oauth.py"
+    )
 
 
 def _convert_single_xlsx_to_pdf_google(drive_service, creds, xlsx_path: Path, pdf_path: Path) -> None:
@@ -307,36 +373,38 @@ def _convert_single_xlsx_to_pdf_google(drive_service, creds, xlsx_path: Path, pd
         pass
 
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
-    # У SA квота Drive = 0: грузим в расшаренную пользователем папку (квота владельца).
-    # Ищем первую доступную папку, расшаренную на этот Service Account.
-    parent_id = None
-    try:
-        shared = (
-            drive_service.files()
-            .list(
-                q="sharedWithMe=true and mimeType='application/vnd.google-apps.folder' and trashed=false",
-                pageSize=10,
-                fields="files(id,name)",
-                supportsAllDrives=True,
-            )
-            .execute()
-            .get("files", [])
-        )
-        if shared:
-            parent_id = shared[0]["id"]
-    except Exception:
-        parent_id = None
-    if not parent_id:
-        raise RuntimeError(
-            "У Service Account нулевая квота Drive. Расшарьте любую папку вашего Google Drive\n"
-            "на excel-worker-converter@excel-worker-507412.iam.gserviceaccount.com (роль Editor) —\n"
-            "конвертация сама найдёт её и будет грузить файлы туда (файлы удаляются после конвертации)."
-        )
+    # OAuth = свой Drive с квотой: грузим в корень, ничего искать не надо.
+    # Service Account квоты не имеет: грузим в расшаренную пользователем папку (квота владельца).
+    is_sa = type(creds).__module__.startswith("google.oauth2.service_account")
     file_metadata = {
         "name": xlsx_path.stem,
         "mimeType": "application/vnd.google-apps.spreadsheet",
-        "parents": [parent_id],
     }
+    if is_sa:
+        parent_id = None
+        try:
+            shared = (
+                drive_service.files()
+                .list(
+                    q="sharedWithMe=true and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                    pageSize=10,
+                    fields="files(id,name)",
+                    supportsAllDrives=True,
+                )
+                .execute()
+                .get("files", [])
+            )
+            if shared:
+                parent_id = shared[0]["id"]
+        except Exception:
+            parent_id = None
+        if not parent_id:
+            raise RuntimeError(
+                "У Service Account нулевая квота Drive. Расшарьте любую папку вашего Google Drive\n"
+                "на этот Service Account (роль Editor) — конвертация сама найдёт её и будет\n"
+                "грузить файлы туда (файлы удаляются после конвертации)."
+            )
+        file_metadata["parents"] = [parent_id]
     media = MediaFileUpload(
         str(xlsx_path),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2680,11 +2748,14 @@ class ExcelFinderApp(tk.Tk):
             has_google_lib = True
         except ImportError:
             has_google_lib = False
+        has_oauth = _get_embedded_oauth_info() is not None
         has_emb = _get_embedded_sa_info() is not None
-        if has_google_lib and has_emb:
-            lines.append("✓ Google: ключ вшит в программу")
+        if has_google_lib and has_oauth:
+            lines.append("✓ Google: OAuth-токен вшит в программу")
+        elif has_google_lib and has_emb:
+            lines.append("✓ Google: ключ SA вшит в программу")
         elif has_google_lib:
-            lines.append("○ Google: нет ключа (укажите в Actions секрет GOOGLE_SERVICE_ACCOUNT_JSON)")
+            lines.append("○ Google: нет данных (укажите в Actions секрет GOOGLE_OAUTH_TOKEN)")
         else:
             lines.append("✗ Google: нет библиотек (pip install google-api-python-client)")
 

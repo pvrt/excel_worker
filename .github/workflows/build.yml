@@ -39,9 +39,18 @@ jobs:
           python tools/gen_embedded_sa.py
           if (Test-Path "google_sa_embedded.py") { Get-Item google_sa_embedded.py | Select-Object Name, Length }
 
+      - name: Embed Google OAuth token (from secret)
+        shell: pwsh
+        env:
+          GOOGLE_OAUTH_TOKEN: ${{ secrets.GOOGLE_OAUTH_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GOOGLE_OAUTH_TOKEN)) { "WARNING: GOOGLE_OAUTH_TOKEN secret is empty - Google engine will need embedded SA or manual keys" }
+          python tools/gen_embedded_oauth.py
+          if (Test-Path "google_oauth_embedded.py") { Get-Item google_oauth_embedded.py | Select-Object Name, Length }
+
       - name: Build EXE with PyInstaller
         run: |
-          pyinstaller --onefile --noconsole --name "ExcelWorker" --hidden-import google_sa_embedded app.py
+          pyinstaller --onefile --noconsole --name "ExcelWorker" --hidden-import google_sa_embedded --hidden-import google_oauth_embedded app.py
           dir dist
           if (!(Test-Path "dist/ExcelWorker.exe")) { throw "ExcelWorker.exe not found" }
 

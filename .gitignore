@@ -51,7 +51,9 @@ credentials.json
 token.json
 *_credentials.json
 *_token.json
+client_secret*.json
 google_sa_embedded.py
+google_oauth_embedded.py
 
 # Opencode state
 .omo/
