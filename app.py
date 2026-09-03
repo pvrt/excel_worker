@@ -307,16 +307,46 @@ def _convert_single_xlsx_to_pdf_google(drive_service, creds, xlsx_path: Path, pd
         pass
 
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    # У SA квота Drive = 0: грузим в расшаренную пользователем папку (квота владельца).
+    # Ищем первую доступную папку, расшаренную на этот Service Account.
+    parent_id = None
+    try:
+        shared = (
+            drive_service.files()
+            .list(
+                q="sharedWithMe=true and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                pageSize=10,
+                fields="files(id,name)",
+                supportsAllDrives=True,
+            )
+            .execute()
+            .get("files", [])
+        )
+        if shared:
+            parent_id = shared[0]["id"]
+    except Exception:
+        parent_id = None
+    if not parent_id:
+        raise RuntimeError(
+            "У Service Account нулевая квота Drive. Расшарьте любую папку вашего Google Drive\n"
+            "на excel-worker-converter@excel-worker-507412.iam.gserviceaccount.com (роль Editor) —\n"
+            "конвертация сама найдёт её и будет грузить файлы туда (файлы удаляются после конвертации)."
+        )
     file_metadata = {
         "name": xlsx_path.stem,
         "mimeType": "application/vnd.google-apps.spreadsheet",
+        "parents": [parent_id],
     }
     media = MediaFileUpload(
         str(xlsx_path),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         resumable=True,
     )
-    uploaded = drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+    uploaded = (
+        drive_service.files()
+        .create(body=file_metadata, media_body=media, fields="id", supportsAllDrives=True)
+        .execute()
+    )
     file_id = uploaded.get("id")
     if not file_id:
         raise RuntimeError("Google Drive не вернул fileId")
