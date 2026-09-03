@@ -466,6 +466,210 @@ def _convert_single_xlsx_to_pdf_google(drive_service, creds, xlsx_path: Path, pd
             pass
 
 
+def _ensure_google_creds(creds) -> None:
+    """Обновляет протухший токен Google (OAuth по refresh_token, SA — self-refresh)."""
+    try:
+        if getattr(creds, "expired", False):
+            from google.auth.transport.requests import Request
+
+            try:
+                creds.refresh(Request())
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _google_sa_shared_parent(drive_service):
+    """ID расшаренной на Service Account папки (у SA нет своей квоты). None если не найдена."""
+    try:
+        shared = (
+            drive_service.files()
+            .list(
+                q="sharedWithMe=true and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                pageSize=10,
+                fields="files(id,name)",
+                supportsAllDrives=True,
+            )
+            .execute()
+            .get("files", [])
+        )
+        if shared:
+            return shared[0]["id"]
+    except Exception:
+        pass
+    return None
+
+
+def _google_upload_spreadsheet(drive_service, local_path: Path, name: str, src_mime: str, parent_id=None) -> str:
+    """Заливает локальный файл как Google-таблицу. Возвращает fileId."""
+    from googleapiclient.http import MediaFileUpload
+
+    meta = {"name": name, "mimeType": "application/vnd.google-apps.spreadsheet"}
+    if parent_id:
+        meta["parents"] = [parent_id]
+    media = MediaFileUpload(str(local_path), mimetype=src_mime, resumable=True)
+    uploaded = (
+        drive_service.files().create(body=meta, media_body=media, fields="id", supportsAllDrives=True).execute()
+    )
+    file_id = uploaded.get("id")
+    if not file_id:
+        raise RuntimeError("Google Drive не вернул fileId")
+    return file_id
+
+
+def _google_export_bytes(creds, file_id: str, params: str) -> bytes:
+    """Скачивает экспорт Google-таблицы (params вида 'exportFormat=csv&format=csv')."""
+    try:
+        import ssl
+
+        ssl._create_default_https_context = ssl._create_unverified_context
+    except Exception:
+        pass
+    import requests
+
+    export_url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?{params}"
+    headers = {"Authorization": f"Bearer {creds.token}"}
+    try:
+        try:
+            import certifi
+
+            ca = certifi.where()
+        except Exception:
+            ca = True
+        resp = requests.get(export_url, headers=headers, timeout=120, verify=ca)
+        resp.raise_for_status()
+    except requests.exceptions.SSLError as se:
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        try:
+            resp = requests.get(export_url, headers=headers, timeout=120, verify=False)
+            resp.raise_for_status()
+        except Exception as e2:
+            raise RuntimeError(f"SSL ошибка экспорта Google: {se}. Повтор с verify=False не помог: {e2}") from e2
+    if not resp.content:
+        raise RuntimeError("Google вернул пустой экспорт")
+    return resp.content
+
+
+def process_merge_excel_google(
+    source_dir: str,
+    output_xlsx: str,
+    skip_header: bool,
+    recursive: bool,
+    sheet_name: str,
+    log_callback,
+    progress_callback,
+    finish_callback,
+):
+    """Сливает все xlsx/xls из папки в один лист через Google Drive (заливка -> CSV -> склейка -> xlsx).
+
+    Каждый файл читается как первый лист таблицы; строки складываются подряд.
+    """
+    import csv
+    import tempfile
+
+    try:
+        src = Path(source_dir)
+        out = Path(output_xlsx)
+        pattern = src.rglob if recursive else src.glob
+        all_files = sorted(
+            p
+            for p in list(pattern("*.xlsx")) + list(pattern("*.xls"))
+            if not p.name.startswith("~$") and p.is_file()
+        )
+        total = len(all_files)
+        if total == 0:
+            finish_callback(False, "В указанной папке нет файлов .xlsx / .xls")
+            return
+
+        log_callback(f"Файлов для слияния: {total}")
+        log_callback(f"Исходная папка: {src}")
+        log_callback("Движок: Google Sheets (вшитый ключ)")
+
+        drive_service, creds = _get_google_drive_service()
+        _ensure_google_creds(creds)
+        is_sa = type(creds).__module__.startswith("google.oauth2.service_account")
+        parent_id = None
+        if is_sa:
+            parent_id = _google_sa_shared_parent(drive_service)
+            if not parent_id:
+                finish_callback(
+                    False,
+                    "У Service Account нулевая квота Drive. Расшарьте любую папку вашего Google Drive\n"
+                    "на этот Service Account (роль Editor).",
+                )
+                return
+
+        XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        merged = []
+        ok_count = 0
+        for idx, fpath in enumerate(all_files, 1):
+            progress_callback(int(((idx - 1) / total) * 90))
+            file_id = None
+            try:
+                file_id = _google_upload_spreadsheet(drive_service, fpath, fpath.stem, XLSX_MIME, parent_id)
+                raw = _google_export_bytes(creds, file_id, "exportFormat=csv&format=csv")
+                text = raw.decode("utf-8-sig")
+                rows = [r for r in csv.reader(text.splitlines()) if any(c.strip() for c in r)]
+                if not rows:
+                    log_callback(f"[{idx}/{total}] {fpath.name}: пустой лист, пропущен")
+                    continue
+                if skip_header and ok_count > 0:
+                    rows = rows[1:]
+                merged.extend(rows)
+                ok_count += 1
+                log_callback(f"[{idx}/{total}] OK {fpath.name}: строк {len(rows)}")
+            except Exception as e:
+                log_callback(f"[{idx}/{total}] Ошибка {fpath.name}: {e}")
+            finally:
+                if file_id:
+                    try:
+                        drive_service.files().delete(fileId=file_id).execute()
+                    except Exception:
+                        pass
+
+        if not merged:
+            finish_callback(False, "Не удалось прочитать данные ни из одного файла.")
+            return
+
+        # Пишем склейку во временный CSV и заливаем обратно, чтобы Google собрал итоговый xlsx
+        sheet = (sheet_name or "Свод").strip() or "Свод"
+        tmp_csv = None
+        merged_id = None
+        try:
+            fd, tmp_csv = tempfile.mkstemp(prefix="xmerge_", suffix=".csv")
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                csv.writer(f).writerows(merged)
+            progress_callback(93)
+            merged_id = _google_upload_spreadsheet(drive_service, Path(tmp_csv), sheet, "text/csv", parent_id)
+            progress_callback(96)
+            xlsx_bytes = _google_export_bytes(creds, merged_id, "exportFormat=xlsx&format=xlsx")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with open(out, "wb") as f:
+                f.write(xlsx_bytes)
+        finally:
+            if merged_id:
+                try:
+                    drive_service.files().delete(fileId=merged_id).execute()
+                except Exception:
+                    pass
+            if tmp_csv:
+                try:
+                    os.remove(tmp_csv)
+                except Exception:
+                    pass
+
+        progress_callback(100)
+        finish_callback(True, f"Готово!\nФайлов слито: {ok_count} из {total}\nСтрок в итоге: {len(merged)}\nФайл: {out}")
+    except Exception as e:
+        try:
+            finish_callback(False, f"Ошибка слияния: {e}")
+        except Exception:
+            pass
+
+
 def _convert_single_xlsx_to_pdf_excel(excel_app, xlsx_path: Path, pdf_path: Path) -> None:
     """Конвертирует один xlsx в pdf через уже запущенный Excel COM-объект. Стараемся убрать лишние пустые страницы."""
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1607,6 +1811,7 @@ class ExcelFinderApp(tk.Tk):
         self.tab_diff = ttk.Frame(notebook)
         self.tab_pdf = ttk.Frame(notebook)
         self.tab_merge = ttk.Frame(notebook)
+        self.tab_xmerge = ttk.Frame(notebook)
 
         notebook.add(self.tab_bulk, text="  Массовое сопоставление  ")
         notebook.add(self.tab_single, text="  Поиск по списку строк  ")
@@ -1614,6 +1819,7 @@ class ExcelFinderApp(tk.Tk):
         notebook.add(self.tab_diff, text="  Сравнение колонок (Diff)  ")
         notebook.add(self.tab_pdf, text="  Конвертер XLSX -> PDF  ")
         notebook.add(self.tab_merge, text="  Объединение PDF  ")
+        notebook.add(self.tab_xmerge, text="  Объединение Excel  ")
 
         self._build_tab_bulk()
         self._build_tab_single()
@@ -1621,6 +1827,7 @@ class ExcelFinderApp(tk.Tk):
         self._build_tab_diff()
         self._build_tab_pdf()
         self._build_tab_merge()
+        self._build_tab_xmerge()
 
     def _add_tab_description(self, parent, text: str):
         """Добавляет голубой блок-описание вверху вкладки простым языком."""
@@ -2726,7 +2933,7 @@ class ExcelFinderApp(tk.Tk):
             font=("Segoe UI", 8),
             foreground="#666",
             justify="left",
-        ).pack(anchor="w", padx=(26, 0), pady=(0, 2))
+        ).pack(anchor="w", padx=(6, 0), pady=(0, 2))
 
         # Выбор движка
         frame_engine = ttk.LabelFrame(self.tab_pdf, text=" 3. Движок конвертации ", padding=10)
@@ -3040,6 +3247,135 @@ class ExcelFinderApp(tk.Tk):
     def _on_merge_finish(self, success, msg):
         self.btn_merge_run.config(state="normal")
         self.merge_progress["value"] = 100 if success else 0
+        if success:
+            messagebox.showinfo("Готово", msg)
+        else:
+            messagebox.showerror("Ошибка", msg)
+
+    def _build_tab_xmerge(self):
+        pad_opts = {"padx": 10, "pady": 6}
+        self._add_tab_description(
+            self.tab_xmerge,
+            "Сливает все Excel-файлы из папки в один файл: каждый файл читается\n"
+            "через Google Sheets, строки складываются подряд в один лист.",
+        )
+        frame_src = ttk.LabelFrame(self.tab_xmerge, text=" 1. Папка и результат ", padding=10)
+        frame_src.pack(fill="x", **pad_opts)
+
+        ttk.Label(frame_src, text="Папка с Excel:").grid(row=0, column=0, sticky="w")
+        self.ent_xmerge_src = ttk.Entry(frame_src, width=60)
+        self.ent_xmerge_src.grid(row=0, column=1, padx=5, sticky="ew")
+        ttk.Button(frame_src, text="Обзор...", command=self._browse_xmerge_src).grid(row=0, column=2, padx=3)
+
+        ttk.Label(frame_src, text="Итоговый файл:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.ent_xmerge_out = ttk.Entry(frame_src, width=60)
+        self.ent_xmerge_out.grid(row=1, column=1, padx=5, pady=(6, 0), sticky="ew")
+        ttk.Button(frame_src, text="Куда...", command=self._browse_xmerge_out).grid(row=1, column=2, padx=3, pady=(6, 0))
+
+        ttk.Label(frame_src, text="Имя листа:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.ent_xmerge_sheet = ttk.Entry(frame_src, width=30)
+        self.ent_xmerge_sheet.grid(row=2, column=1, padx=5, pady=(6, 0), sticky="w")
+        self.ent_xmerge_sheet.insert(0, "Свод")
+        frame_src.columnconfigure(1, weight=1)
+
+        frame_opts = ttk.LabelFrame(self.tab_xmerge, text=" 2. Параметры ", padding=10)
+        frame_opts.pack(fill="x", **pad_opts)
+        self.var_xmerge_recursive = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frame_opts, text="Искать файлы в подпапках", variable=self.var_xmerge_recursive
+        ).pack(anchor="w")
+        self.var_xmerge_header = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frame_opts,
+            text="Первая строка — заголовок\n(в остальных файлах пропускать)",
+            variable=self.var_xmerge_header,
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Label(frame_opts, text="Движок: Google Sheets (ключ уже вшит)").pack(anchor="w", pady=(6, 0))
+
+        self.btn_xmerge_run = ttk.Button(
+            self.tab_xmerge, text="Слить в один файл", command=self._start_xmerge
+        )
+        self.btn_xmerge_run.pack(pady=(2, 4))
+        self.xmerge_progress = ttk.Progressbar(self.tab_xmerge, mode="determinate", maximum=100)
+        self.xmerge_progress.pack(fill="x", padx=10, pady=2)
+
+        frame_log = ttk.LabelFrame(self.tab_xmerge, text=" 3. Журнал ", padding=8)
+        frame_log.pack(fill="both", expand=True, **pad_opts)
+        self.txt_xmerge_log = tk.Text(frame_log, height=10, wrap="word", font=("Consolas", 9))
+        self.txt_xmerge_log.pack(fill="both", expand=True)
+
+        frame_actions = ttk.Frame(self.tab_xmerge)
+        frame_actions.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Button(frame_actions, text="📂 Открыть папку", command=self._open_xmerge_output_folder).pack(side="right", padx=3)
+        ttk.Button(frame_actions, text="Очистить журнал", command=lambda: self.txt_xmerge_log.delete(1.0, tk.END)).pack(side="right", padx=3)
+
+    def _browse_xmerge_src(self):
+        path = filedialog.askdirectory(title="Выберите папку с Excel файлами")
+        if path:
+            self.ent_xmerge_src.delete(0, tk.END)
+            self.ent_xmerge_src.insert(0, path)
+            if not self.ent_xmerge_out.get():
+                p = Path(path)
+                self.ent_xmerge_out.insert(0, str(p.parent / f"{p.name}_merged.xlsx"))
+
+    def _browse_xmerge_out(self):
+        path = filedialog.asksaveasfilename(
+            title="Куда сохранить объединённый Excel",
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+        )
+        if path:
+            self.ent_xmerge_out.delete(0, tk.END)
+            self.ent_xmerge_out.insert(0, path)
+
+    def _open_xmerge_output_folder(self):
+        out = self.ent_xmerge_out.get().strip()
+        folder = str(Path(out).parent) if out else ""
+        if not folder or not os.path.isdir(folder):
+            messagebox.showwarning("Предупреждение", "Папка ещё не создана или путь не указан.")
+            return
+        try:
+            system_name = platform.system()
+            if system_name == "Windows":
+                os.startfile(folder)
+            elif system_name == "Darwin":
+                subprocess.run(["open", folder], check=True)
+            else:
+                subprocess.run(["xdg-open", folder], check=True)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось открыть папку: {e}")
+
+    def _start_xmerge(self):
+        src = self.ent_xmerge_src.get().strip()
+        out = self.ent_xmerge_out.get().strip()
+        sheet = self.ent_xmerge_sheet.get().strip() or "Свод"
+        if not src or not os.path.isdir(src):
+            messagebox.showwarning("Предупреждение", "Укажите корректную папку с Excel файлами!")
+            return
+        if not out:
+            messagebox.showwarning("Предупреждение", "Укажите путь для сохранения результата!")
+            return
+        self.txt_xmerge_log.delete(1.0, tk.END)
+        self.xmerge_progress["value"] = 0
+        self.btn_xmerge_run.config(state="disabled")
+        threading.Thread(
+            target=process_merge_excel_google,
+            args=(
+                src,
+                out,
+                self.var_xmerge_header.get(),
+                self.var_xmerge_recursive.get(),
+                sheet,
+                lambda t: self.after(0, lambda: (self.txt_xmerge_log.insert(tk.END, t + "\n"), self.txt_xmerge_log.see(tk.END))),
+                lambda v: self.after(0, lambda: self.xmerge_progress.config(value=v)),
+                lambda s, m: self.after(0, lambda: self._on_xmerge_finish(s, m)),
+            ),
+            daemon=True,
+        ).start()
+
+    def _on_xmerge_finish(self, success, msg):
+        self.btn_xmerge_run.config(state="normal")
+        self.xmerge_progress["value"] = 100 if success else 0
         if success:
             messagebox.showinfo("Готово", msg)
         else:
