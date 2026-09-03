@@ -670,6 +670,325 @@ def process_merge_excel_google(
             pass
 
 
+def _list_merge_files(source_dir: str, recursive: bool):
+    """Список .xlsx/.xls для слияния (без временных ~$)."""
+    src = Path(source_dir)
+    pattern = src.rglob if recursive else src.glob
+    return sorted(
+        p
+        for p in list(pattern("*.xlsx")) + list(pattern("*.xls"))
+        if not p.name.startswith("~$") and p.is_file()
+    )
+
+
+def _merge_rows_nonempty(rows):
+    """Убирает полностью пустые строки (None/'')."""
+    return [r for r in rows if any(c is not None and str(c).strip() != "" for c in r)]
+
+
+def _write_merged_xlsx(rows, out: Path, sheet_name: str) -> None:
+    """Пишет склейку строк в xlsx через openpyxl."""
+    from openpyxl import Workbook
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = (sheet_name or "Свод").strip() or "Свод"
+    for r in rows:
+        ws.append(list(r))
+    wb.save(out)
+
+
+def process_merge_excel_local(
+    source_dir: str,
+    output_xlsx: str,
+    skip_header: bool,
+    recursive: bool,
+    sheet_name: str,
+    log_callback,
+    progress_callback,
+    finish_callback,
+):
+    """Сливает xlsx локально через openpyxl (быстро, без сети). Файлы .xls не читаются."""
+    try:
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            finish_callback(False, "Не установлен openpyxl.\nУстановите: pip install openpyxl")
+            return
+        src = Path(source_dir)
+        out = Path(output_xlsx)
+        all_files = _list_merge_files(source_dir, recursive)
+        total = len(all_files)
+        if total == 0:
+            finish_callback(False, "В указанной папке нет файлов .xlsx / .xls")
+            return
+
+        log_callback(f"Файлов для слияния: {total}")
+        log_callback(f"Исходная папка: {src}")
+        log_callback("Движок: openpyxl (локально)")
+
+        merged = []
+        ok_count = 0
+        skipped_xls = 0
+        for idx, fpath in enumerate(all_files, 1):
+            progress_callback(int(((idx - 1) / total) * 90))
+            if fpath.suffix.lower() == ".xls":
+                skipped_xls += 1
+                log_callback(f"[{idx}/{total}] {fpath.name}: .xls не читается openpyxl, пропущен (движок Excel)")
+                continue
+            try:
+                wb = load_workbook(fpath, read_only=True, data_only=True)
+                try:
+                    ws = wb.active
+                    rows = _merge_rows_nonempty(list(ws.iter_rows(values_only=True)))
+                finally:
+                    wb.close()
+                if not rows:
+                    log_callback(f"[{idx}/{total}] {fpath.name}: пустой лист, пропущен")
+                    continue
+                if skip_header and ok_count > 0:
+                    rows = rows[1:]
+                merged.extend(rows)
+                ok_count += 1
+                log_callback(f"[{idx}/{total}] OK {fpath.name}: строк {len(rows)}")
+            except Exception as e:
+                log_callback(f"[{idx}/{total}] Ошибка {fpath.name}: {e}")
+
+        if not merged:
+            finish_callback(False, "Не удалось прочитать данные ни из одного файла.")
+            return
+
+        progress_callback(93)
+        _write_merged_xlsx(merged, out, sheet_name)
+        progress_callback(100)
+        msg = f"Готово!\nФайлов слито: {ok_count} из {total}\nСтрок в итоге: {len(merged)}\nФайл: {out}"
+        if skipped_xls:
+            msg += f"\nПропущено .xls (нужен движок Excel): {skipped_xls}"
+        finish_callback(True, msg)
+    except Exception as e:
+        try:
+            finish_callback(False, f"Ошибка слияния: {e}")
+        except Exception:
+            pass
+
+
+def process_merge_excel_excel(
+    source_dir: str,
+    output_xlsx: str,
+    skip_header: bool,
+    recursive: bool,
+    sheet_name: str,
+    log_callback,
+    progress_callback,
+    finish_callback,
+):
+    """Сливает xlsx/xls локально через Microsoft Excel (COM). Читает и старые .xls."""
+    excel_app = None
+    try:
+        if not _is_excel_available():
+            finish_callback(
+                False,
+                "Microsoft Excel не найден для работы через COM.\nПроверьте, что Excel установлен на Windows.",
+            )
+            return
+        try:
+            import win32com.client
+            import pythoncom
+
+            pythoncom.CoInitialize()
+        except ImportError:
+            finish_callback(False, "Не установлен pywin32.\nУстановите: pip install pywin32")
+            return
+        src = Path(source_dir)
+        out = Path(output_xlsx)
+        all_files = _list_merge_files(source_dir, recursive)
+        total = len(all_files)
+        if total == 0:
+            finish_callback(False, "В указанной папке нет файлов .xlsx / .xls")
+            return
+
+        log_callback(f"Файлов для слияния: {total}")
+        log_callback(f"Исходная папка: {src}")
+        log_callback("Движок: Microsoft Excel (COM)")
+
+        excel_app = win32com.client.DispatchEx("Excel.Application")
+        excel_app.Visible = False
+        excel_app.DisplayAlerts = False
+        try:
+            excel_app.ScreenUpdating = False
+        except Exception:
+            pass
+
+        merged = []
+        ok_count = 0
+        for idx, fpath in enumerate(all_files, 1):
+            progress_callback(int(((idx - 1) / total) * 90))
+            wb = None
+            try:
+                wb = excel_app.Workbooks.Open(str(fpath.resolve()), ReadOnly=True)
+                ws = wb.Worksheets(1)
+                used = ws.UsedRange.Value
+                if used is None:
+                    log_callback(f"[{idx}/{total}] {fpath.name}: пустой лист, пропущен")
+                    continue
+                # UsedRange.Value: скаляр для 1 ячейки, иначе кортеж кортежей
+                rows = [used] if not isinstance(used, tuple) else [list(r) if isinstance(r, tuple) else [r] for r in used]
+                rows = _merge_rows_nonempty(rows)
+                if not rows:
+                    log_callback(f"[{idx}/{total}] {fpath.name}: пустой лист, пропущен")
+                    continue
+                if skip_header and ok_count > 0:
+                    rows = rows[1:]
+                merged.extend(rows)
+                ok_count += 1
+                log_callback(f"[{idx}/{total}] OK {fpath.name}: строк {len(rows)}")
+            except Exception as e:
+                log_callback(f"[{idx}/{total}] Ошибка {fpath.name}: {e}")
+            finally:
+                if wb is not None:
+                    try:
+                        wb.Close(False)
+                    except Exception:
+                        pass
+
+        if not merged:
+            finish_callback(False, "Не удалось прочитать данные ни из одного файла.")
+            return
+
+        progress_callback(93)
+        _write_merged_xlsx(merged, out, sheet_name)
+        progress_callback(100)
+        finish_callback(True, f"Готово!\nФайлов слито: {ok_count} из {total}\nСтрок в итоге: {len(merged)}\nФайл: {out}")
+    except Exception as e:
+        try:
+            finish_callback(False, f"Ошибка слияния: {e}")
+        except Exception:
+            pass
+    finally:
+        if excel_app is not None:
+            try:
+                excel_app.Quit()
+            except Exception:
+                pass
+
+
+def process_merge_excel_libre(
+    source_dir: str,
+    output_xlsx: str,
+    skip_header: bool,
+    recursive: bool,
+    sheet_name: str,
+    log_callback,
+    progress_callback,
+    finish_callback,
+):
+    """Сливает xlsx/xls локально через LibreOffice (каждый файл -> CSV -> склейка)."""
+    import csv
+    import subprocess
+    import tempfile
+
+    try:
+        soffice = find_soffice_executable()
+        if not soffice:
+            finish_callback(
+                False,
+                "LibreOffice не найден.\nУстановите с https://www.libreoffice.org/\nили выберите другой движок.",
+            )
+            return
+        src = Path(source_dir)
+        out = Path(output_xlsx)
+        all_files = _list_merge_files(source_dir, recursive)
+        total = len(all_files)
+        if total == 0:
+            finish_callback(False, "В указанной папке нет файлов .xlsx / .xls")
+            return
+
+        log_callback(f"Файлов для слияния: {total}")
+        log_callback(f"Исходная папка: {src}")
+        log_callback("Движок: LibreOffice (локально)")
+
+        merged = []
+        ok_count = 0
+        with tempfile.TemporaryDirectory(prefix="xmerge_libre_") as tmpdir:
+            for idx, fpath in enumerate(all_files, 1):
+                progress_callback(int(((idx - 1) / total) * 90))
+                try:
+                    r = subprocess.run(
+                        [soffice, "--headless", "--convert-to", "csv", "--outdir", tmpdir, str(fpath)],
+                        capture_output=True,
+                        timeout=300,
+                    )
+                    csv_path = Path(tmpdir) / f"{fpath.stem}.csv"
+                    if r.returncode != 0 or not csv_path.is_file():
+                        err = (r.stderr or b"").decode("utf-8", "replace").strip()[:200]
+                        log_callback(f"[{idx}/{total}] Ошибка {fpath.name}: конвертация LibreOffice ({err})")
+                        continue
+                    try:
+                        text = csv_path.read_text(encoding="utf-8-sig")
+                    except UnicodeDecodeError:
+                        text = csv_path.read_text(encoding="cp1251")
+                    rows = _merge_rows_nonempty([r for r in csv.reader(text.splitlines())])
+                    if not rows:
+                        log_callback(f"[{idx}/{total}] {fpath.name}: пустой лист, пропущен")
+                        continue
+                    if skip_header and ok_count > 0:
+                        rows = rows[1:]
+                    merged.extend(rows)
+                    ok_count += 1
+                    log_callback(f"[{idx}/{total}] OK {fpath.name}: строк {len(rows)}")
+                except Exception as e:
+                    log_callback(f"[{idx}/{total}] Ошибка {fpath.name}: {e}")
+
+        if not merged:
+            finish_callback(False, "Не удалось прочитать данные ни из одного файла.")
+            return
+
+        progress_callback(93)
+        _write_merged_xlsx(merged, out, sheet_name)
+        progress_callback(100)
+        finish_callback(True, f"Готово!\nФайлов слито: {ok_count} из {total}\nСтрок в итоге: {len(merged)}\nФайл: {out}")
+    except Exception as e:
+        try:
+            finish_callback(False, f"Ошибка слияния: {e}")
+        except Exception:
+            pass
+
+
+def process_merge_excel(
+    source_dir: str,
+    output_xlsx: str,
+    skip_header: bool,
+    recursive: bool,
+    sheet_name: str,
+    log_callback,
+    progress_callback,
+    finish_callback,
+    engine: str = "google",
+):
+    """Диспетчер слияния Excel: 'google' / 'openpyxl' / 'excel' / 'libre'."""
+    engine = (engine or "google").lower()
+    if engine == "openpyxl":
+        return process_merge_excel_local(
+            source_dir, output_xlsx, skip_header, recursive, sheet_name,
+            log_callback, progress_callback, finish_callback,
+        )
+    if engine == "excel":
+        return process_merge_excel_excel(
+            source_dir, output_xlsx, skip_header, recursive, sheet_name,
+            log_callback, progress_callback, finish_callback,
+        )
+    if engine == "libre":
+        return process_merge_excel_libre(
+            source_dir, output_xlsx, skip_header, recursive, sheet_name,
+            log_callback, progress_callback, finish_callback,
+        )
+    return process_merge_excel_google(
+        source_dir, output_xlsx, skip_header, recursive, sheet_name,
+        log_callback, progress_callback, finish_callback,
+    )
+
+
 def _convert_single_xlsx_to_pdf_excel(excel_app, xlsx_path: Path, pdf_path: Path) -> None:
     """Конвертирует один xlsx в pdf через уже запущенный Excel COM-объект. Стараемся убрать лишние пустые страницы."""
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3256,8 +3575,8 @@ class ExcelFinderApp(tk.Tk):
         pad_opts = {"padx": 10, "pady": 6}
         self._add_tab_description(
             self.tab_xmerge,
-            "Сливает все Excel-файлы из папки в один файл: каждый файл читается\n"
-            "через Google Sheets, строки складываются подряд в один лист.",
+            "Сливает все Excel-файлы из папки в один файл: файлы читаются выбранным\n"
+            "движком, строки складываются подряд в один лист.",
         )
         frame_src = ttk.LabelFrame(self.tab_xmerge, text=" 1. Папка и результат ", padding=10)
         frame_src.pack(fill="x", **pad_opts)
@@ -3290,7 +3609,22 @@ class ExcelFinderApp(tk.Tk):
             text="Первая строка — заголовок\n(в остальных файлах пропускать)",
             variable=self.var_xmerge_header,
         ).pack(anchor="w", pady=(4, 0))
-        ttk.Label(frame_opts, text="Движок: Google Sheets (ключ уже вшит)").pack(anchor="w", pady=(6, 0))
+        ttk.Label(frame_opts, text="Движок:").pack(anchor="w", pady=(6, 0))
+        self.var_xmerge_engine = tk.StringVar(value="google")
+        frame_xeng = ttk.Frame(frame_opts)
+        frame_xeng.pack(anchor="w")
+        ttk.Radiobutton(
+            frame_xeng, text="Google Sheets (ключ уже вшит)", variable=self.var_xmerge_engine, value="google"
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            frame_xeng, text="openpyxl (локально, быстро; .xls не читает)", variable=self.var_xmerge_engine, value="openpyxl"
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            frame_xeng, text="Microsoft Excel (локально; читает и .xls)", variable=self.var_xmerge_engine, value="excel"
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            frame_xeng, text="LibreOffice (локально; через CSV)", variable=self.var_xmerge_engine, value="libre"
+        ).pack(anchor="w")
 
         self.btn_xmerge_run = ttk.Button(
             self.tab_xmerge, text="Слить в один файл", command=self._start_xmerge
@@ -3359,7 +3693,7 @@ class ExcelFinderApp(tk.Tk):
         self.xmerge_progress["value"] = 0
         self.btn_xmerge_run.config(state="disabled")
         threading.Thread(
-            target=process_merge_excel_google,
+            target=process_merge_excel,
             args=(
                 src,
                 out,
@@ -3370,6 +3704,7 @@ class ExcelFinderApp(tk.Tk):
                 lambda v: self.after(0, lambda: self.xmerge_progress.config(value=v)),
                 lambda s, m: self.after(0, lambda: self._on_xmerge_finish(s, m)),
             ),
+            kwargs={"engine": self.var_xmerge_engine.get()},
             daemon=True,
         ).start()
 
