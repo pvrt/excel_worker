@@ -29,7 +29,7 @@
 2. Тип **JSON** → **Create** → скачается файл вида `hdv-monster-...-a1b2c3.json`
 3. **Переименуйте** его в `credentials.json` и положите **рядом с `app.py`** (при разработке) или **рядом с `ExcelWorker.exe`** (при раздаче). Путь можно выбрать в последней вкладке → `credentials.json:` → Обзор.
 
-> **Важно:** `credentials.json` типа `service_account` содержит приватный ключ. Добавлен в `.gitignore` — не коммитьте его! Для сборки `PyInstaller` ключ **не вшивается** в exe, а лежит рядом — просто раздайте `exe + credentials.json` вместе.
+> **Важно:** `credentials.json` типа `service_account` содержит приватный ключ. В `.gitignore` — не коммитьте его и `google_sa_embedded.py`! Ключ **вшивается** в exe на этапе сборки из секрета `GOOGLE_SERVICE_ACCOUNT_JSON`, рядом с exe ничего не нужно.
 
 ## 5. (Опционально) Расшарьте папку — не обязательно
 
@@ -38,8 +38,8 @@
 
 ## 6. Проверьте подключение
 
-1. В `ExcelWorker` → вкладка **Конвертер XLSX → PDF** → выберите движок **Только Google Sheets**
-2. Укажите путь к `credentials.json` (по умолчанию рядом с exe) → **🔑 Проверить подключение Google**
+1. В `ExcelWorker` → вкладка **Конвертер XLSX → PDF** → выберите движок **Только Google Sheets** (панель настроек сама не открывается — ключ уже вшит, ничего указывать не нужно)
+2. Если нужны свои ключи: **Настройки Google (свои ключи)...** → укажите пути → **🔑 Проверить подключение Google**
 3. Должно показать `Подключение успешно!` (делает `files.list(pageSize=1)`). `token.json` **не нужен** для Service Account (игнорируется).
 
 ## 7. Конвертация
@@ -47,16 +47,13 @@
 - Выберите папку с `xlsx`, выходную папку, схему именования, **Движок: Google Sheets** → **Конвертировать в PDF**
 - Параметры экспорта: `A4, альбом (portrait=false), fitw=true, gridlines=true, fzr=true` (`app.py:236`).
 
-## 8. Сборка для раздачи
+## 8. Сборка для раздачи (ключ вшивается в exe, рядом ничего не нужно)
 
-```bash
-pip install -r requirements.txt
-pyinstaller --onefile --noconsole --name "ExcelWorker" app.py
-# Раздайте:
-# dist/ExcelWorker.exe
-# credentials.json  (service_account, рядом с exe)
-# Инструкция: положить оба файла в одну папку и запустить
-```
+1. GitHub → Settings → Secrets → Actions → секрет `GOOGLE_SERVICE_ACCOUNT_JSON` = содержимое JSON ключа целиком.
+2. `git push` → workflow сам делает `python tools/gen_embedded_sa.py` (генерит `google_sa_embedded.py`, в `.gitignore`) и собирает `pyinstaller --onefile --noconsole --name ExcelWorker --hidden-import google_sa_embedded app.py`.
+3. Раздайте один `dist/ExcelWorker.exe` — внутри уже ключ (`_get_embedded_sa_info` → `SACredentials.from_service_account_info`, без браузера и файлов).
+
+Локально: `python tools/gen_embedded_sa.py` (читает `credentials.json`, НЕ коммитить) → `pyinstaller ExcelWorker.spec`.
 
 При `PyInstaller --onefile` путь к `credentials.json` определяется как `Path(sys.executable).parent / "credentials.json"` (`app.py:15` `_get_app_dir()`), поэтому рядом с exe.
 

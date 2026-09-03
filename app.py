@@ -64,6 +64,69 @@ def _resolve_google_path(path: str) -> str:
     return str(p)
 
 
+def _get_embedded_sa_info():
+    """Возвращает dict Service Account, вшитый на этапе сборки, или None.
+
+    Источники (по приоритету):
+    1. Модуль google_sa_embedded.py (генерируется CI из секрета GOOGLE_SERVICE_ACCOUNT_JSON,
+       локально — из credentials.json; попадает в exe автоматически как .py-модуль).
+    2. Переменная окружения GOOGLE_SERVICE_ACCOUNT_JSON (raw JSON или base64).
+    """
+    # 1. сгенерированный модуль рядом с app.py (в exe — внутри bundle)
+    try:
+        from google_sa_embedded import GOOGLE_SA_JSON as _emb  # type: ignore
+
+        if isinstance(_emb, dict) and _emb.get("type") == "service_account":
+            return _emb
+        if isinstance(_emb, str) and _emb.strip():
+            import json as _json
+
+            _d = _json.loads(_emb)
+            if isinstance(_d, dict) and _d.get("type") == "service_account":
+                return _d
+    except Exception:
+        pass
+    # 2. env (удобно для CI/отладки без файлов)
+    try:
+        import json as _json
+        import base64 as _b64
+
+        raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+        if raw:
+            _d = None
+            if raw.startswith("{"):
+                _d = _json.loads(raw)
+            else:
+                try:
+                    _d = _json.loads(_b64.b64decode(raw).decode("utf-8"))
+                except Exception:
+                    _d = None
+            if isinstance(_d, dict) and _d.get("type") == "service_account":
+                return _d
+    except Exception:
+        pass
+    return None
+
+
+def _has_google_credentials() -> bool:
+    """True если есть вшитый SA, env SA или файл credentials.json (exe/bundle/cwd)."""
+    if _get_embedded_sa_info() is not None:
+        return True
+    for cand in (str(_get_app_dir() / "credentials.json"), "credentials.json"):
+        try:
+            if os.path.isfile(_resolve_google_path(cand)):
+                return True
+        except Exception:
+            pass
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        try:
+            if (Path(sys._MEIPASS) / "credentials.json").is_file():  # type: ignore[attr-defined]
+                return True
+        except Exception:
+            pass
+    return False
+
+
 # ==============================================================================
 #                             ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==============================================================================
@@ -251,11 +314,7 @@ GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
 def _get_google_drive_service(credentials_path: str = "credentials.json", token_path: str = "token.json"):
-    """Создаёт сервис Google Drive с OAuth (credentials.json -> token.json). Поддерживает Service Account."""
-    # Резолвим пути: ищем рядом с exe, в bundle, в cwd
-    credentials_path = _resolve_google_path(credentials_path)
-    # token ищем, но для записи всегда используем папку рядом с exe
-    token_path_resolved = _resolve_google_path(token_path)
+    """Создаёт сервис Google Drive. Приоритет: вшитый SA (сборка) -> env -> файл SA -> OAuth. Браузера для SA нет."""
     # Для корпоративных прокси с самоподписанным сертификатом — отключаем проверку SSL
     try:
         import ssl
@@ -274,7 +333,26 @@ def _get_google_drive_service(credentials_path: str = "credentials.json", token_
             "pip install google-api-python-client google-auth google-auth-oauthlib requests"
         ) from e
 
-    # --- Service Account (для раздачи другим) ---
+    # --- 0. Вшитый Service Account (этап сборки, файлов рядом с exe не нужно) ---
+    try:
+        _emb = _get_embedded_sa_info()
+        if _emb:
+            from google.oauth2.service_account import Credentials as SACredentials
+
+            creds = SACredentials.from_service_account_info(_emb, scopes=GOOGLE_DRIVE_SCOPES)
+            service = build("drive", "v3", credentials=creds)
+            return service, creds
+    except Exception as e:
+        # Пробрасываем invalid_grant наверх с понятным текстом, fallback на файлы не делаем —
+        # иначе молча откроется OAuth-браузер, чего быть не должно.
+        raise RuntimeError(f"Google Service Account (вшитый) отклонён: {e}") from e
+
+    # Резолвим пути: ищем рядом с exe, в bundle, в cwd (только если нет вшитого)
+    credentials_path = _resolve_google_path(credentials_path)
+    # token ищем, но для записи всегда используем папку рядом с exe
+    token_path_resolved = _resolve_google_path(token_path)
+
+    # --- Service Account из файла (для локальной разработки) ---
     try:
         import json
 
@@ -2712,10 +2790,11 @@ class ExcelFinderApp(tk.Tk):
             has_google_lib = True
         except ImportError:
             has_google_lib = False
+        has_emb = _get_embedded_sa_info() is not None
         cred_default = str(_get_app_dir() / "credentials.json")
-        has_cred = os.path.isfile(cred_default)
-        is_sa = False
-        if has_cred:
+        has_cred = has_emb or os.path.isfile(cred_default)
+        is_sa = has_emb
+        if not is_sa and has_cred and os.path.isfile(cred_default):
             try:
                 import json
 
@@ -2723,12 +2802,14 @@ class ExcelFinderApp(tk.Tk):
                     is_sa = json.load(_f).get("type") == "service_account"
             except Exception:
                 is_sa = False
-        if has_google_lib and has_cred and is_sa:
+        if has_google_lib and has_emb:
+            lines.append("✓ Google: ключ вшит в программу")
+        elif has_google_lib and has_cred and is_sa:
             lines.append("✓ Google: Service Account готов")
         elif has_google_lib and has_cred:
             lines.append("✓ Google: готов (библиотеки + credentials.json)")
         elif has_google_lib:
-            lines.append("○ Google: библиотеки есть, нет credentials.json")
+            lines.append("○ Google: нет ключа (укажите в Actions секрет GOOGLE_SERVICE_ACCOUNT_JSON)")
         else:
             lines.append("✗ Google: нет библиотек (pip install google-api-python-client)")
 
@@ -2746,10 +2827,17 @@ class ExcelFinderApp(tk.Tk):
             fg = "#c0392b"
         engine_info = " | ".join(lines) + f"  ->  {auto_hint}."
         ttk.Label(frame_engine, text=engine_info, font=("Segoe UI", 8), foreground=fg, wraplength=780, justify="left", anchor="w").pack(anchor="w", pady=(6, 0))
+        # Ручной тумблер расширенных настроек (свои ключи). По умолчанию скрыт, сам не открывается.
+        self.btn_google_advanced = ttk.Button(
+            frame_engine,
+            text="Настройки Google (свои ключи)...",
+            command=self._toggle_google_frame,
+        )
+        self.btn_google_advanced.pack(anchor="w", pady=(4, 0))
 
-        # Настройки Google (видны только при выборе Google)
-        self.frame_google = ttk.LabelFrame(self.tab_pdf, text=" Настройки Google Sheets ", padding=10)
-        # не pack сразу, покажем по выбору движка
+        # Расширенные настройки Google (скрыты; ключи вшиты на этапе сборки)
+        self.frame_google = ttk.LabelFrame(self.tab_pdf, text=" Настройки Google Sheets (расширенные) ", padding=10)
+        # не pack сразу, только по ручному тумблеру
 
         self.frame_google_cred = ttk.Frame(self.frame_google)
         self.frame_google_cred.pack(fill="x", pady=2)
@@ -3060,51 +3148,15 @@ class ExcelFinderApp(tk.Tk):
             messagebox.showerror("Ошибка", msg)
 
     def _on_pdf_engine_changed(self):
-        """Показывает/скрывает настройки Google. Если credentials встроены — не показываем ничего."""
+        """Панель настроек Google больше не всплывает сама. Ключи вшиты на этапе сборки."""
         if not hasattr(self, "frame_google") or not hasattr(self, "var_pdf_engine"):
             return
-        eng = self.var_pdf_engine.get()
-        if eng != "google":
-            self.frame_google.pack_forget()
-            return
-        # Для Google проверяем, есть ли встроенные/найденные credentials
+        # Никогда не показываем автоматически — только ручной тумблер в расширенных.
+        # Если ключей нет, ошибка понятно покажется в логе при конвертации.
         try:
-            cred_path = self.ent_google_creds.get().strip() if hasattr(self, "ent_google_creds") else str(_get_app_dir() / "credentials.json")
-            resolved = _resolve_google_path(cred_path) if cred_path else ""
-            has_cred = resolved and os.path.isfile(resolved)
-            if not has_cred:
-                # пробуем найти рядом с exe/bundle
-                for cand in [str(_get_app_dir() / "credentials.json"), "credentials.json"]:
-                    cand_res = _resolve_google_path(cand)
-                    if cand_res and os.path.isfile(cand_res):
-                        has_cred = True
-                        break
-                # также bundle
-                if not has_cred and getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-                    try:
-                        b = Path(sys._MEIPASS) / "credentials.json"  # type: ignore[attr-defined]
-                        if b.is_file():
-                            has_cred = True
-                    except Exception:
-                        pass
-            try:
-                import googleapiclient  # noqa: F401
-
-                has_lib = True
-            except ImportError:
-                has_lib = False
-            # Если всё готово — не показываем настройки вообще, просто работаем
-            if has_cred and has_lib:
-                self.frame_google.pack_forget()
-                return
+            self.frame_google.pack_forget()
         except Exception:
             pass
-        # Иначе показываем настройки (нет встроенных)
-        try:
-            self.frame_google.pack(fill="x", padx=10, pady=5, before=self.btn_pdf_run)
-        except Exception:
-            self.frame_google.pack(fill="x", padx=10, pady=5)
-        self._update_google_embedded_status()
 
     def _browse_google_creds(self):
         path = filedialog.askopenfilename(title="Выберите credentials.json", filetypes=[("JSON", "*.json"), ("All", "*.*")])
@@ -3127,11 +3179,17 @@ class ExcelFinderApp(tk.Tk):
     def _test_google_connection(self):
         cred = self.ent_google_creds.get().strip() if hasattr(self, "ent_google_creds") else "credentials.json"
         tok = self.ent_google_token.get().strip() if hasattr(self, "ent_google_token") else "token.json"
-        if not cred or not os.path.isfile(cred):
-            messagebox.showwarning("Проверка Google", f"Не найден файл credentials.json:\n{cred}")
+        # Вшитый ключ приоритетнее полей ввода
+        try:
+            _emb = _get_embedded_sa_info()
+        except Exception:
+            _emb = None
+        if _emb is None and (not cred or not os.path.isfile(_resolve_google_path(cred))):
+            messagebox.showwarning("Проверка Google", f"Нет вшитого ключа и не найден файл:\n{cred}")
             return
         try:
-            self.txt_pdf_log.insert(tk.END, f"Проверка Google Drive... {cred}\n")
+            src = "вшитый ключ" if _emb is not None else cred
+            self.txt_pdf_log.insert(tk.END, f"Проверка Google Drive... {src}\n")
             self.txt_pdf_log.see(tk.END)
             service, creds = _get_google_drive_service(cred, tok)
             # пробный запрос — список файлов (1)
@@ -3148,10 +3206,14 @@ class ExcelFinderApp(tk.Tk):
         if not hasattr(self, "lbl_google_embedded"):
             return
         try:
+            try:
+                _emb = _get_embedded_sa_info()
+            except Exception:
+                _emb = None
             cred = self.ent_google_creds.get().strip() if hasattr(self, "ent_google_creds") else str(_get_app_dir() / "credentials.json")
             resolved = _resolve_google_path(cred) if cred else ""
-            has_cred = False
-            if resolved and os.path.isfile(resolved):
+            has_cred = _emb is not None
+            if not has_cred and resolved and os.path.isfile(resolved):
                 has_cred = True
             else:
                 app_cred = _get_app_dir() / "credentials.json"
@@ -3184,22 +3246,41 @@ class ExcelFinderApp(tk.Tk):
                 pass
             if has_cred:
                 try:
-                    import json
+                    if _emb is not None:
+                        self.lbl_google_embedded.config(text="✓ Ключ Service Account вшит в программу — просто выберите Google.", foreground="#1a7f37")
+                    else:
+                        import json
 
-                    with open(resolved, "r", encoding="utf-8") as f:
-                        is_sa = json.load(f).get("type") == "service_account"
-                    typ = "Service Account" if is_sa else "OAuth"
-                    self.lbl_google_embedded.config(text=f"✓ Найдено {typ} credentials.json — указывать путь не нужно, просто выберите Google.", foreground="#1a7f37")
+                        with open(resolved, "r", encoding="utf-8") as f:
+                            is_sa = json.load(f).get("type") == "service_account"
+                        typ = "Service Account" if is_sa else "OAuth"
+                        self.lbl_google_embedded.config(text=f"✓ Найдено {typ} credentials.json — указывать путь не нужно, просто выберите Google.", foreground="#1a7f37")
                 except Exception:
                     self.lbl_google_embedded.config(text="✓ Найдены credentials.json — указывать путь не нужно.", foreground="#1a7f37")
             else:
-                self.lbl_google_embedded.config(text="○ Встроенные credentials.json не найдены — укажите путь или положите рядом с exe.", foreground="#b7791f")
+                self.lbl_google_embedded.config(text="○ Ключ не вшит (секрет GOOGLE_SERVICE_ACCOUNT_JSON пуст) — задайте свои пути ниже.", foreground="#b7791f")
         except Exception:
             pass
 
     def _toggle_google_settings(self):
         self._google_settings_visible = not getattr(self, "_google_settings_visible", False)
         self._update_google_embedded_status()
+
+    def _toggle_google_frame(self):
+        """Ручное открытие/закрытие расширенных настроек Google. Автоматически не вызывается."""
+        try:
+            if self.frame_google.winfo_ismapped():
+                self.frame_google.pack_forget()
+                self.btn_google_advanced.config(text="Настройки Google (свои ключи)...")
+            else:
+                try:
+                    self.frame_google.pack(fill="x", padx=10, pady=5, before=self.btn_pdf_run)
+                except Exception:
+                    self.frame_google.pack(fill="x", padx=10, pady=5)
+                self.btn_google_advanced.config(text="Скрыть настройки Google")
+                self._update_google_embedded_status()
+        except Exception:
+            pass
 
     def _browse_pdf_src(self):
         path = filedialog.askdirectory(title="Выберите папку с XLSX файлами")

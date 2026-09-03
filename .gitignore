@@ -45,8 +45,13 @@ desktop.ini
 tmp/
 temp/
 
-# Google OAuth — приватный репо, push protection разрешён вами
-# credentials.json
-# token.json
-# *_credentials.json
-# *_token.json
+# Google: ключи НЕ коммитим — вшиваются на этапе сборки из секрета Actions.
+# Локально: python tools/gen_embedded_sa.py (читает credentials.json, НЕ коммитить).
+credentials.json
+token.json
+*_credentials.json
+*_token.json
+google_sa_embedded.py
+
+# Opencode state
+.omo/
