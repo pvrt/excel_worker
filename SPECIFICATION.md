@@ -111,7 +111,7 @@
 * Рекурсивный сбор `.xlsx` (исключая временные `~$`), выходная папка по умолчанию `<src>_pdf`.
 * Схема именования: имя файла / имя родительской папки; опция сохранения структуры папок; уникализация суффиксом `_1`.
 * Движки (`auto/libre/excel/reportlab/google`): LibreOffice (`--headless --convert-to pdf`, пропуск пустых страниц, обрезка print area) → Excel COM (PrintArea=UsedRange, FitToPagesWide=1) → reportlab (компактная страница для малых таблиц) → Google Drive (загрузка как spreadsheet → экспорт A4 альбом fitw → удаление).
-* Google: ключ Service Account вшит на этапе сборки (`tools/gen_embedded_sa.py` из секрета `GOOGLE_SERVICE_ACCOUNT_JSON`); панель настроек сама не открывается, только ручной тумблер.
+* Google: ключ Service Account вшит на этапе сборки (`tools/gen_embedded_sa.py` из секрета `GOOGLE_SERVICE_ACCOUNT_JSON`); настроек Google в интерфейсе нет вообще.
 
 ### Вкладка 6: Объединение PDF
 
