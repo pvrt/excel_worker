@@ -2701,13 +2701,15 @@ class ExcelFinderApp(tk.Tk):
             text="При совпадении имён автоматически добавится суффикс _1, _2 ...  •  Недопустимые символы заменяются на _",
             font=("Segoe UI", 8),
             foreground="#666",
+            wraplength=380,
+            justify="left",
         ).pack(anchor="w", pady=(6, 0))
 
         # Опция сохранения структуры
         self.var_pdf_keep_structure = tk.BooleanVar(value=False)
         chk_keep = ttk.Checkbutton(
             frame_naming,
-            text="Сохранять структуру папок  (в выходной папке создавать такие же подпапки, как в исходной)",
+            text="Сохранять структуру папок\n(в выходной папке создавать такие же подпапки, как в исходной)",
             variable=self.var_pdf_keep_structure,
         )
         chk_keep.pack(anchor="w", pady=(10, 2))
@@ -2715,7 +2717,7 @@ class ExcelFinderApp(tk.Tk):
         self.var_pdf_skip_existing = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             frame_naming,
-            text="Пропускать уже сконвертированные  (если PDF уже есть в выходной папке — не конвертировать повторно)",
+            text="Пропускать уже сконвертированные\n(если PDF уже есть в выходной папке — не конвертировать повторно)",
             variable=self.var_pdf_skip_existing,
         ).pack(anchor="w", pady=(2, 2))
         ttk.Label(
@@ -2730,7 +2732,7 @@ class ExcelFinderApp(tk.Tk):
         frame_engine = ttk.LabelFrame(self.tab_pdf, text=" 3. Движок конвертации ", padding=10)
         frame_engine.pack(fill="x", **pad_opts)
 
-        self.var_pdf_engine = tk.StringVar(value="auto")
+        self.var_pdf_engine = tk.StringVar(value="google")
         ttk.Radiobutton(frame_engine, text="Google Sheets", value="google", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
         ttk.Radiobutton(frame_engine, text="LibreOffice (точная, сохраняет форматирование, нужен установленный LibreOffice)", value="libre", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
         ttk.Radiobutton(frame_engine, text="Microsoft Excel (точная, нужен установленный Microsoft Excel)", value="excel", variable=self.var_pdf_engine).pack(anchor="w", pady=1)
