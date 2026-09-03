@@ -1120,6 +1120,7 @@ def process_xlsx_to_pdf(
     finish_callback,
     keep_structure: bool = False,
     engine: str = "auto",
+    skip_existing: bool = True,
 ):
     """Фоновая конвертация папки с xlsx в pdf с выбором схемы именования.
 
@@ -1279,6 +1280,7 @@ def process_xlsx_to_pdf(
         used_names_per_dir: dict[str, set[str]] = {}
         success = 0
         errors = 0
+        skipped = 0
 
         for idx, fpath in enumerate(all_files, 1):
             try:
@@ -1307,19 +1309,29 @@ def process_xlsx_to_pdf(
                     base = fpath.stem
 
                 base = sanitize_filename(base)
-                # Уникализация имени в пределах целевой папки
+                # Уникализация имени в пределах текущей сессии
                 dir_key = str(target_dir).lower()
                 if dir_key not in used_names_per_dir:
                     used_names_per_dir[dir_key] = set()
                 used = used_names_per_dir[dir_key]
                 candidate = base
                 counter = 1
-                # Учитываем уже занятые имена в этой сессии и существующие файлы на диске в target_dir
-                while candidate.lower() in used or (target_dir / f"{candidate}.pdf").exists():
+                while candidate.lower() in used:
                     candidate = f"{base}_{counter}"
                     counter += 1
                 used.add(candidate.lower())
                 target_pdf = target_dir / f"{candidate}.pdf"
+
+                # Уже сконвертирован ранее — пропускаем без повторной конвертации
+                if skip_existing and target_pdf.exists():
+                    try:
+                        rel_skip = str(target_pdf.relative_to(out))
+                    except ValueError:
+                        rel_skip = target_pdf.name
+                    log_callback(f"[{idx}/{total}] Пропуск {fpath.name}: уже есть {rel_skip}")
+                    skipped += 1
+                    progress_callback(int((idx / total) * 100))
+                    continue
 
                 if use_libre:
                     # Конвертация через LibreOffice (промежуточный файл в tmp)
@@ -1391,6 +1403,8 @@ def process_xlsx_to_pdf(
                 pass
 
         msg = f"Конвертация завершена!\nУспешно: {success} из {total}"
+        if skipped:
+            msg += f"\nПропущено (уже были): {skipped}"
         if errors:
             msg += f"\nОшибок: {errors}"
         msg += f"\nПапка с PDF: {out}"
@@ -2697,6 +2711,13 @@ class ExcelFinderApp(tk.Tk):
             variable=self.var_pdf_keep_structure,
         )
         chk_keep.pack(anchor="w", pady=(10, 2))
+        # Опция пропуска уже сконвертированных
+        self.var_pdf_skip_existing = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frame_naming,
+            text="Пропускать уже сконвертированные  (если PDF уже есть в выходной папке — не конвертировать повторно)",
+            variable=self.var_pdf_skip_existing,
+        ).pack(anchor="w", pady=(2, 2))
         ttk.Label(
             frame_naming,
             text="Если включено:  исходная/2024/отчет.xlsx  ->  выходная/2024/отчет.pdf  (или .../2024.pdf при выборе «имя папки»).\nЕсли выключено — все PDF складываются в одну папку.",
@@ -3060,6 +3081,7 @@ class ExcelFinderApp(tk.Tk):
         naming = self.var_pdf_naming.get()
         keep = self.var_pdf_keep_structure.get()
         engine = self.var_pdf_engine.get() if hasattr(self, "var_pdf_engine") else "auto"
+        skip = self.var_pdf_skip_existing.get() if hasattr(self, "var_pdf_skip_existing") else True
 
         if not src or not os.path.isdir(src):
             messagebox.showwarning("Предупреждение", "Укажите корректную исходную папку с XLSX!")
@@ -3083,6 +3105,7 @@ class ExcelFinderApp(tk.Tk):
                 lambda s, m: self.after(0, lambda: self._on_pdf_finish(s, m)),
                 keep,
                 engine,
+                skip,
             ),
             daemon=True,
         ).start()
